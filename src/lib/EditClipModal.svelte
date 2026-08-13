@@ -1,12 +1,13 @@
 <script lang="ts">
     import type { Clip } from "./db";
     import { updateClip } from "./db";
+    import { appState } from "./state.svelte";
 
-    let { clip, onClose, onSaved } = $props<{
+    let { clip, onClose, onSaved }: {
         clip: Clip;
         onClose: () => void;
         onSaved: () => void;
-    }>();
+    } = $props();
 
     let title = $state("");
     let startTime = $state(0);
@@ -33,9 +34,10 @@
             await updateClip(updatedClip);
             onSaved();
             onClose();
+            appState.showToast("Clip updated", "success");
         } catch (e) {
             console.error(e);
-            alert("Failed to update clip: " + e);
+            appState.showToast(`Failed to update clip: ${String(e)}`, "error");
         } finally {
             saving = false;
         }

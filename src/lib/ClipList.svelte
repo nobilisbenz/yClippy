@@ -1,6 +1,6 @@
 <script lang="ts">
     import { appState } from "./state.svelte";
-    import { deleteClip, renameClip, updateClipSortOrder, type Clip } from "./db";
+    import { deleteClip, renameClip, restoreClip, updateClipSortOrder, type Clip } from "./db";
     import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
     let { videoId, seekTo } = $props<{
@@ -15,26 +15,38 @@
         const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
         const index = clips.findIndex((c) => c.id === clipId);
         if (index <= 0) return;
-        
-        const updates: { id: number; sort_order: number }[] = [
-            { id: clips[index].id!, sort_order: index - 1 },
-            { id: clips[index - 1].id!, sort_order: index },
-        ];
-        await updateClipSortOrder(updates);
-        await appState.refreshActiveClips();
+
+        [clips[index - 1], clips[index]] = [clips[index], clips[index - 1]];
+
+        const updates: { id: number; sort_order: number }[] = [];
+        clips.forEach((clip, i) => {
+            if (clip.sort_order !== i) {
+                updates.push({ id: clip.id!, sort_order: i });
+            }
+        });
+        if (updates.length > 0) {
+            await updateClipSortOrder(updates);
+            await appState.refreshActiveClips();
+        }
     }
 
     async function moveClipDown(clipId: number) {
         const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
         const index = clips.findIndex((c) => c.id === clipId);
         if (index === -1 || index >= clips.length - 1) return;
-        
-        const updates: { id: number; sort_order: number }[] = [
-            { id: clips[index].id!, sort_order: index + 1 },
-            { id: clips[index + 1].id!, sort_order: index },
-        ];
-        await updateClipSortOrder(updates);
-        await appState.refreshActiveClips();
+
+        [clips[index], clips[index + 1]] = [clips[index + 1], clips[index]];
+
+        const updates: { id: number; sort_order: number }[] = [];
+        clips.forEach((clip, i) => {
+            if (clip.sort_order !== i) {
+                updates.push({ id: clip.id!, sort_order: i });
+            }
+        });
+        if (updates.length > 0) {
+            await updateClipSortOrder(updates);
+            await appState.refreshActiveClips();
+        }
     }
 
     function getIsFirstClip(clipId: number): boolean {
@@ -47,16 +59,19 @@
         return clips[clips.length - 1]?.id === clipId;
     }
 
-    async function handleClipReorder(draggedId: number, targetId: number) {
+    async function handleClipReorder(draggedId: number, targetId: number, before: boolean) {
         const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
-        
+
         const draggedIndex = clips.findIndex((c) => c.id === draggedId);
         if (draggedIndex === -1) return;
 
         const [draggedClip] = clips.splice(draggedIndex, 1);
-        const targetIndex = clips.findIndex((c) => c.id === targetId);
+        let targetIndex = clips.findIndex((c) => c.id === targetId);
         if (targetIndex === -1) return;
 
+        if (!before) {
+            targetIndex += 1;
+        }
         clips.splice(targetIndex, 0, draggedClip);
 
         const updates: { id: number; sort_order: number }[] = [];
@@ -94,7 +109,7 @@
     function handleDrop(e: DragEvent, targetId: number) {
         e.preventDefault();
         if (draggedClipId !== null && draggedClipId !== targetId) {
-            handleClipReorder(draggedClipId, targetId);
+            handleClipReorder(draggedClipId, targetId, true);
         }
         draggedClipId = null;
         dragOverClipId = null;
@@ -106,68 +121,69 @@
     }
 
     async function handleDelete(id: number) {
-        if (confirm("Delete clip?")) {
-            await deleteClip(id);
+        const clip = appState.activeClips.find((c) => c.id === id);
+        if (!clip) return;
+        const snapshot = appState.activeClips;
+        await deleteClip(id);
+        await appState.refreshActiveClips();
+        appState.showUndo(`Deleted clip "${clip.title}"`, async () => {
+            await restoreClip(id);
+            appState.activeClips = snapshot;
             await appState.refreshActiveClips();
-        }
+        });
     }
 
     async function handleCopy(clip: any, e?: MouseEvent) {
         e?.stopPropagation();
         try {
-            let template = appState.settings.clipboardTemplate || "";
-            const code = template
-                .replace(/\\n/g, "\n")
-                .replace(/\/n/g, "\n")
-                .replace(/{id}/gi, videoId)
-                .replace(/{start}/gi, Math.floor(clip.start_time).toString())
-                .replace(/{end}/gi, Math.floor(clip.end_time).toString())
-                .replace(/{title}/gi, clip.title || `Clip`)
-                .replace(
-                    /{url}/gi,
-                    `https://www.youtube.com/watch?v=${videoId}&t=${Math.floor(clip.start_time)}s`,
-                );
-
+            const code = renderTemplate(clip);
             await writeText(code);
-            alert("Copied custom template to clipboard!");
+            appState.showToast("Copied to clipboard", "success");
         } catch (e) {
             console.error(e);
-            alert("Clipboard Error: " + e);
+            appState.showToast(`Clipboard error: ${String(e)}`, "error");
         }
     }
     async function handleCopyAll() {
         if (appState.activeClips.length === 0) return;
 
         try {
-            let template = appState.settings.clipboardTemplate || "";
             const allClipsContent = appState.activeClips
-                .map((clip) => {
-                    return template
-                        .replace(/\\n/g, "\n")
-                        .replace(/\/n/g, "\n")
-                        .replace(/{id}/gi, videoId)
-                        .replace(
-                            /{start}/gi,
-                            Math.floor(clip.start_time).toString(),
-                        )
-                        .replace(
-                            /{end}/gi,
-                            Math.floor(clip.end_time).toString(),
-                        )
-                        .replace(/{title}/gi, clip.title || `Clip`)
-                        .replace(
-                            /{url}/gi,
-                            `https://www.youtube.com/watch?v=${videoId}&t=${Math.floor(clip.start_time)}s`,
-                        );
-                })
+                .map((clip) => renderTemplate(clip))
                 .join("\n\n");
 
             await writeText(allClipsContent);
-            alert("Copied all clips to clipboard!");
+            appState.showToast("Copied all clips to clipboard", "success");
         } catch (e) {
             console.error(e);
-            alert("Clipboard Error: " + e);
+            appState.showToast(`Clipboard error: ${String(e)}`, "error");
         }
+    }
+
+    function renderTemplate(clip: any): string {
+        const template = appState.settings.clipboardTemplate || "";
+        const seconds = Math.floor(clip.start_time);
+        const urlWithTs = `https://www.youtube.com/watch?v=${videoId}&t=${seconds}s`;
+        const endSeconds = Math.floor(clip.end_time);
+        const title = clip.title || "Clip";
+        return template
+            .replace(/\\n/g, "\n")
+            .replace(/{id}/gi, videoId)
+            .replace(/{start}/gi, seconds.toString())
+            .replace(/{start_hms}/gi, formatHMS(seconds))
+            .replace(/{end}/gi, endSeconds.toString())
+            .replace(/{end_hms}/gi, formatHMS(endSeconds))
+            .replace(/{title}/gi, title)
+            .replace(/{url}/gi, urlWithTs);
+    }
+
+    function formatHMS(totalSeconds: number): string {
+        const h = Math.floor(totalSeconds / 3600);
+        const m = Math.floor((totalSeconds % 3600) / 60);
+        const s = Math.floor(totalSeconds % 60);
+        return `${h.toString().padStart(2, "0")}:${m
+            .toString()
+            .padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
     }
 
     // Edit Modal State
@@ -251,7 +267,6 @@
             No clips yet
         </div>
     {:else}
-        <!-- Clip All Button -->
         <button
             onclick={handleCopyAll}
             class="w-full py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded text-sm font-medium transition-colors border border-zinc-700 flex flex-col items-center justify-center gap-1 shrink-0"

@@ -9,30 +9,72 @@
     } from "./db";
     import { appState } from "./state.svelte";
     import ClipSaveModal from "./ClipSaveModal.svelte";
-    import ClipList from "./ClipList.svelte";
+    import ScrubBar from "./ScrubBar.svelte";
 
-    let { video } = $props<{ video: Video }>();
-    let player: any;
+    let { video, seekToTime, seekTo = $bindable() } = $props<{
+        video: Video;
+        seekToTime?: number;
+        seekTo?: (t: number) => void;
+    }>();
+    let player: any = $state(null);
     let currentTime = $state(0);
+    let videoDuration = $state(0);
     let playerContainer: HTMLElement;
+    let playerContainerId = `player-${Math.random().toString(36).slice(2, 9)}`;
+    let isPaused = $state(true);
 
-    // Clipping State
+    export function getPlayer(): any {
+        return player;
+    }
+
     let startTimestamp = $state<number | null>(null);
     let endTimestamp = $state<number | null>(null);
     let isSavingClip = $state(false);
 
-    onMount(async () => {
-        // Load YouTube API if not loaded
-        if (!window.YT) {
+    function loadYouTubeApi(): Promise<void> {
+        return new Promise((resolve) => {
+            if (window.YT && window.YT.Player) {
+                resolve();
+                return;
+            }
+            const existing = document.querySelector('script[data-yt-api]');
+            if (existing) {
+                const prev = window.onYouTubeIframeAPIReady;
+                window.onYouTubeIframeAPIReady = () => {
+                    if (prev) prev();
+                    resolve();
+                };
+                return;
+            }
             const tag = document.createElement("script");
             tag.src = "https://www.youtube.com/iframe_api";
+            tag.setAttribute("data-yt-api", "true");
             const firstScriptTag = document.getElementsByTagName("script")[0];
             firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
-            window.onYouTubeIframeAPIReady = initPlayer;
-        } else {
-            initPlayer();
-        }
+            window.onYouTubeIframeAPIReady = () => resolve();
+        });
+    }
+
+    onMount(async () => {
+        await loadYouTubeApi();
+        if (!video) return;
+        initPlayer();
+
+        const t = setInterval(() => {
+            if (player && player.getCurrentTime) {
+                currentTime = player.getCurrentTime();
+            }
+            if (player?.getDuration) {
+                const d = player.getDuration();
+                if (d > 0) videoDuration = d;
+            }
+        }, 1000);
+        timer = t;
+
+        window.addEventListener("keydown", handleKeyDown);
     });
+
+    let timer: number;
 
     function initPlayer() {
         const startSeconds = Math.max(video.last_position, video.start_time);
@@ -41,29 +83,43 @@
             start: startSeconds,
             rel: 0,
             modestbranding: 1,
-            iv_load_policy: 3, // Hide annotations
-            fs: 0, // Hide fullscreen button
-            disablekb: 1, // Disable keyboard controls if we want strict control
+            iv_load_policy: 3,
         };
         if (video.end_time > 0) {
             playerVars.end = video.end_time;
         }
 
-        player = new window.YT.Player("player", {
+        player = new window.YT.Player(playerContainerId, {
             height: "100%",
             width: "100%",
             videoId: video.id,
             playerVars,
             events: {
-                onReady: onPlayerReady,
+                onReady: (event: any) => {
+                    if (seekToTime !== undefined && event.target?.seekTo) {
+                        event.target.seekTo(seekToTime, true);
+                    }
+                },
                 onStateChange: onPlayerStateChange,
             },
         });
     }
 
-    function onPlayerReady(event: any) {
-        // player ready
-    }
+    $effect(() => {
+        if (seekToTime !== undefined && player?.seekTo) {
+            player.seekTo(seekToTime, true);
+            currentTime = seekToTime;
+        }
+    });
+
+    $effect(() => {
+        seekTo = (t: number) => {
+            if (player?.seekTo) {
+                player.seekTo(t, true);
+                currentTime = t;
+            }
+        };
+    });
 
     function setStart() {
         startTimestamp = currentTime;
@@ -71,7 +127,7 @@
 
     function setEnd() {
         if (startTimestamp === null) {
-            startTimestamp = Math.max(0, currentTime - 5); // Default to 5s before if no start set
+            startTimestamp = Math.max(0, currentTime - 5);
         }
         endTimestamp = currentTime;
 
@@ -88,20 +144,18 @@
         endTimestamp = null;
     }
 
-    let isPaused = $state(false);
-
     function onPlayerStateChange(event: any) {
         if (player && player.getCurrentTime) {
             currentTime = player.getCurrentTime();
         }
-
-        // 1 = playing, 2 = paused
-        if (event.data === 2) {
+        if (player?.getDuration) {
+            const d = player.getDuration();
+            if (d > 0) videoDuration = d;
+        }
+        if (event.data === 1) {
+            isPaused = false;
+        } else if (event.data === 0 || event.data === 2) {
             isPaused = true;
-        } else if (event.data === 1) {
-            isPaused = false;
-        } else {
-            isPaused = false;
         }
     }
 
@@ -115,27 +169,71 @@
         }
     }
 
-    // Polling for time
-    let timer = setInterval(() => {
-        if (player && player.getCurrentTime) {
-            currentTime = player.getCurrentTime();
+    function skip(delta: number) {
+        if (player?.seekTo && player?.getCurrentTime) {
+            const next = Math.max(0, player.getCurrentTime() + delta);
+            player.seekTo(next, true);
+            currentTime = next;
         }
-    }, 1000);
+    }
+
+    function handleKeyDown(e: KeyboardEvent) {
+        if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+        switch (e.key) {
+            case " ":
+                e.preventDefault();
+                togglePlay();
+                break;
+            case "j":
+                skip(-10);
+                break;
+            case "l":
+                skip(10);
+                break;
+            case "ArrowLeft":
+                skip(-5);
+                break;
+            case "ArrowRight":
+                skip(5);
+                break;
+            case "[":
+                setStart();
+                break;
+            case "]":
+                setEnd();
+                break;
+            case "Escape":
+                handleBack();
+                break;
+        }
+    }
 
     onDestroy(async () => {
         clearInterval(timer);
-        if (video) {
-            video.last_position = Math.floor(currentTime);
-            saveVideo(video).then(() => appState.refreshVideos());
+        window.removeEventListener("keydown", handleKeyDown);
+        if (player && player.destroy) {
+            try {
+                player.destroy();
+            } catch (e) {
+                console.error("Failed to destroy player:", e);
+            }
+            player = null;
+        }
+        if (video && video.id) {
+            const positionUpdate: Video = { ...video, last_position: Math.floor(currentTime) };
+            try {
+                await saveVideo(positionUpdate);
+                await appState.refreshVideos();
+            } catch (e) {
+                console.error("Failed to save video position:", e);
+            }
         }
     });
 
     function handleBack() {
-        // Use history back for Android support
         appState.goBack();
     }
 
-    // Swipe Gestures
     let touchStartX = 0;
     let touchEndX = 0;
 
@@ -150,11 +248,9 @@
 
     function handleSwipe() {
         const diff = touchStartX - touchEndX;
-        // Swipe Left (drag right to left) -> Open Sidebar
         if (diff > 50) {
             appState.isClipsSidebarOpen = true;
         }
-        // Swipe Right (drag left to right) -> Close Sidebar
         if (diff < -50) {
             appState.isClipsSidebarOpen = false;
         }
@@ -169,8 +265,7 @@
 >
     <div class="flex-1 flex flex-col relative z-0 min-h-0">
         <div class="flex-1 bg-black relative">
-            <div id="player" class="absolute inset-0 w-full h-full"></div>
-            <!-- Custom Pause Overlay to hide YouTube clutter -->
+            <div id={playerContainerId} class="absolute inset-0 w-full h-full"></div>
             {#if isPaused}
                 <div
                     class="absolute inset-0 z-20 bg-black/20 flex flex-col items-center justify-center cursor-pointer transition-opacity duration-200"
@@ -179,7 +274,6 @@
                     tabindex="0"
                     onkeydown={(e) => e.key === "Enter" && togglePlay()}
                 >
-                    <!-- Back Button in Overlay -->
                     <button
                         onclick={(e) => {
                             e.stopPropagation();
@@ -218,109 +312,104 @@
             {/if}
         </div>
         <div
-            class="h-24 border-t border-zinc-900 bg-zinc-950 p-4 flex items-center justify-between z-10 shrink-0"
+            class="border-t border-zinc-900 bg-zinc-950 px-4 py-3 flex flex-col gap-2 z-10 shrink-0"
+            role="region"
+            aria-label="Transport bar"
         >
-            <div class="flex flex-col">
-                <div class="text-xl font-mono text-white">
-                    {formatTime(currentTime)}
-                </div>
-                {#if startTimestamp !== null}
-                    <div class="text-xs text-blue-400">
-                        Start Set: {startTimestamp.toFixed(1)}s
-                    </div>
-                {/if}
-            </div>
-
-            <div class="flex gap-4">
-                <button
-                    onclick={handleBack}
-                    class="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-sm font-medium transition-colors border border-zinc-700 flex items-center gap-2"
-                    aria-label="Back"
-                >
-                    <svg
-                        class="size-5"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                    >
-                        <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M10 19l-7-7m0 0l7-7m-7 7h18"
-                        />
-                    </svg>
-                </button>
-                <button
-                    onclick={() =>
-                        (appState.isClipsSidebarOpen =
-                            !appState.isClipsSidebarOpen)}
-                    class="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-sm font-medium transition-colors border border-zinc-700 flex items-center gap-2"
-                >
-                    <svg
-                        class="size-5"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                    >
-                        <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M4 6h16M4 12h16M4 18h16"
-                        />
-                    </svg>
-                    <span class="hidden sm:inline">Clips</span>
-                </button>
-                <button
-                    onclick={setStart}
-                    class="px-6 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded text-sm font-medium transition-colors border border-zinc-700"
-                >
-                    {startTimestamp !== null ? "Reset" : "Set Start"}
-                </button>
-                <button
-                    onclick={setEnd}
-                    class="px-6 py-2 bg-red-600 hover:bg-red-700 text-white rounded text-sm font-medium transition-colors shadow-lg shadow-red-900/20"
-                >
-                    Clip
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <div
-        class="{appState.isClipsSidebarOpen
-            ? 'h-[50vh] opacity-100 md:h-full md:w-80 border-t md:border-t-0 md:border-l'
-            : 'h-0 opacity-0 md:h-full md:opacity-100 md:w-0 border-t-0 md:border-l-0'} border-zinc-900 bg-zinc-950 flex flex-col z-10 transition-all duration-300 overflow-hidden shrink-0"
-    >
-        <div
-            class="p-4 border-b border-zinc-900 font-bold flex justify-between items-center whitespace-nowrap"
-        >
-            <span>Clips</span>
-            <button
-                onclick={() => (appState.isClipsSidebarOpen = false)}
-                class="p-1 hover:bg-zinc-800 rounded"
-                aria-label="Close Clips Sidebar"
-            >
-                <svg
-                    class="size-5"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    ><path
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        stroke-width="2"
-                        d="M6 18L18 6M6 6l12 12"
-                    /></svg
-                >
-            </button>
-        </div>
-        <div class="flex-1 w-full md:w-80 overflow-y-auto overflow-x-hidden">
-            <ClipList
-                videoId={video.id}
-                seekTo={(t) => player?.seekTo(t, true)}
+            <ScrubBar
+                {player}
+                {currentTime}
+                duration={videoDuration}
+                clips={appState.activeClips}
+                startMarker={startTimestamp}
+                endMarker={endTimestamp}
+                onSeek={(t) => {
+                    if (player?.seekTo) {
+                        player.seekTo(t, true);
+                        currentTime = t;
+                    }
+                }}
             />
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+                <div class="flex items-center gap-2">
+                    <span class="text-lg font-mono text-white t-num">
+                        {formatTime(currentTime)}
+                    </span>
+                    <span class="text-xs text-zinc-600">/</span>
+                    <span class="text-xs font-mono text-zinc-500 t-num">
+                        {formatTime(videoDuration)}
+                    </span>
+                    {#if startTimestamp !== null}
+                        <span class="text-xs text-blue-400 ml-2">
+                            In: {startTimestamp.toFixed(1)}s
+                            {#if endTimestamp !== null}
+                                Out: {endTimestamp.toFixed(1)}s
+                            {/if}
+                        </span>
+                    {/if}
+                </div>
+
+                <div class="flex items-center gap-2">
+                    <button
+                        onclick={handleBack}
+                        class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-sm transition-colors border border-zinc-700"
+                        aria-label="Back"
+                        title="Esc"
+                    >
+                        <svg
+                            class="size-4"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M10 19l-7-7m0 0l7-7m-7 7h18"
+                            />
+                        </svg>
+                    </button>
+                    <button
+                        onclick={() => skip(-10)}
+                        class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-sm transition-colors border border-zinc-700"
+                        aria-label="Back 10 seconds"
+                        title="j"
+                    >
+                        −10s
+                    </button>
+                    <button
+                        onclick={togglePlay}
+                        class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-sm transition-colors border border-zinc-700"
+                        aria-label={isPaused ? "Play" : "Pause"}
+                        title="Space"
+                    >
+                        {isPaused ? "▶" : "❚❚"}
+                    </button>
+                    <button
+                        onclick={() => skip(10)}
+                        class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-sm transition-colors border border-zinc-700"
+                        aria-label="Forward 10 seconds"
+                        title="l"
+                    >
+                        +10s
+                    </button>
+                    <button
+                        onclick={setStart}
+                        class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded text-sm transition-colors border border-zinc-700"
+                        title="["
+                    >
+                        {startTimestamp !== null ? "↺ In" : "[ In"}
+                    </button>
+                    <button
+                        onclick={setEnd}
+                        class="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded text-sm transition-colors shadow-lg shadow-red-900/20"
+                        title="]"
+                    >
+                        ] Out
+                    </button>
+                </div>
+            </div>
         </div>
     </div>
 

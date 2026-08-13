@@ -5,15 +5,163 @@
         type Video,
         type Folder,
         saveFolder,
+        saveVideo,
         updateVideoFolder,
         updateFolderParent,
         deleteFolder,
         deleteVideo,
         renameFolder,
         renameVideo,
+        restoreFolder,
+        restoreVideo,
         updateSortOrder,
         formatTime,
     } from "./db";
+    import Thumbnail from "./Thumbnail.svelte";
+    import FolderPicker from "./FolderPicker.svelte";
+
+    let { compact = false }: { compact?: boolean } = $props();
+
+    let isAndroid = $derived.by(() => {
+        if (typeof window === "undefined") return false;
+        const ua = navigator.userAgent || "";
+        return /android/i.test(ua);
+    });
+
+    let longPressTimer: number | undefined;
+    let longPressTargetEl: HTMLElement | undefined;
+
+    function startLongPress(target: Video | Folder, e: TouchEvent | MouseEvent) {
+        longPressTargetEl = e.currentTarget as HTMLElement;
+        const isVideo = "title" in target && "thumbnail_url" in target;
+        longPressTimer = setTimeout(() => {
+            let items: { label: string; action: () => void; danger?: boolean }[];
+            if (isVideo) {
+                const video = target as Video;
+                items = [
+                    {
+                        label: "Play",
+                        action: () => appState.openVideo(video),
+                    },
+                    {
+                        label: "Move to…",
+                        action: () => {
+                            folderPickerTitle = `Move "${video.title}"`;
+                            if (folderPickerRef) folderPickerRef.moveVideo(video);
+                            isFolderPickerOpen = true;
+                        },
+                    },
+                    {
+                        label: "Delete",
+                        danger: true,
+                        action: () =>
+                            handleDeleteVideo(video.id, new MouseEvent("click")),
+                    },
+                ];
+            } else {
+                const folder = target as Folder;
+                items = [
+                    {
+                        label: "Open",
+                        action: () => appState.openFolder([folder.id!]),
+                    },
+                    {
+                        label: "Move to…",
+                        action: () => {
+                            folderPickerTitle = `Move folder "${folder.name}"`;
+                            folderPickerExcludedFolder = folder.id;
+                            if (folderPickerRef) folderPickerRef.moveFolder(folder);
+                            isFolderPickerOpen = true;
+                        },
+                    },
+                    {
+                        label: "Delete",
+                        danger: true,
+                        action: () =>
+                            handleDeleteFolder(folder.id!, new MouseEvent("click")),
+                    },
+                ];
+            }
+
+            const rect = longPressTargetEl?.getBoundingClientRect();
+            const cx = rect ? rect.left + rect.width / 2 : 100;
+            const cy = rect ? rect.top + rect.height / 2 : 100;
+            appState.contextMenu = {
+                x: cx,
+                y: cy,
+                items,
+                show: true,
+            };
+            if (navigator.vibrate) navigator.vibrate(50);
+        }, 500) as unknown as number;
+    }
+
+    function cancelLongPress() {
+        if (longPressTimer !== undefined) {
+            clearTimeout(longPressTimer);
+            longPressTimer = undefined;
+        }
+    }
+
+    let renamingFolder = $state<Folder | null>(null);
+    let renamingVideo = $state<Video | null>(null);
+    let renamingText = $state("");
+    let creatingFolder = $state(false);
+    let newFolderName = $state("");
+    let isFolderPickerOpen = $state(false);
+    let folderPickerExcludedFolder = $state<number | undefined>(undefined);
+    let folderPickerTitle = $state("Move to folder");
+    let folderPickerRef = $state<{
+        moveVideo: (v: Video) => void;
+        moveFolder: (f: Folder) => void;
+        setSelectedVideo: (v: Video) => void;
+    } | undefined>();
+
+    function startRenameFolder(folder: Folder) {
+        renamingFolder = folder;
+        renamingVideo = null;
+        renamingText = folder.name;
+    }
+
+    function startRenameVideo(video: Video) {
+        renamingVideo = video;
+        renamingFolder = null;
+        renamingText = video.title;
+    }
+
+    async function commitRename() {
+        const newName = renamingText.trim();
+        if (!newName) {
+            cancelRename();
+            return;
+        }
+        if (renamingFolder && newName !== renamingFolder.name) {
+            await renameFolder(renamingFolder.id!, newName);
+            await appState.refreshFolders();
+        } else if (renamingVideo && newName !== renamingVideo.title) {
+            await renameVideo(renamingVideo.id, newName);
+            await appState.refreshVideos();
+        }
+        cancelRename();
+    }
+
+    function cancelRename() {
+        renamingFolder = null;
+        renamingVideo = null;
+        renamingText = "";
+    }
+
+    function openVideoEdit(video: Video) {
+        appState.videoToEdit = { ...video };
+        appState.isEditVideoModalOpen = true;
+    }
+
+    function focusOnMount(node: HTMLInputElement) {
+        queueMicrotask(() => {
+            node.focus();
+            node.select();
+        });
+    }
 
     let draggingVideoId = $state<string | null>(null);
     let draggingFolderId = $state<number | null>(null);
@@ -60,21 +208,29 @@
     });
 
     async function handleCreateFolder() {
-        // Create in the currently active folder (the last one in selectionPath)
+        creatingFolder = true;
+        newFolderName = "";
+    }
+
+    async function commitCreateFolder() {
+        const name = newFolderName.trim();
+        creatingFolder = false;
+        newFolderName = "";
+        if (!name) return;
         const parentId =
             appState.selectionPath.length > 0
                 ? appState.selectionPath[appState.selectionPath.length - 1]
                 : null;
-        const name = prompt("Folder Name:");
-        if (name) {
-            await saveFolder({
-                name,
-                created_at: Date.now(),
-                parent_id: parentId,
-                sort_order: 0,
-            });
-            await appState.refreshFolders();
-        }
+        const maxOrder = appState.folders
+            .filter((f) => f.parent_id === parentId)
+            .reduce((max, f) => Math.max(max, f.sort_order), -1);
+        await saveFolder({
+            name,
+            created_at: Date.now(),
+            parent_id: parentId,
+            sort_order: maxOrder + 1,
+        });
+        await appState.refreshFolders();
     }
 
     function selectFolder(folderId: number, depth: number) {
@@ -92,26 +248,48 @@
 
     async function handleDeleteFolder(id: number, e: MouseEvent) {
         e.stopPropagation();
-        if (confirm("Delete folder and move items to root?")) {
-            await deleteFolder(id);
+        const folder = appState.folders.find((f) => f.id === id);
+        if (!folder) return;
+
+        const snapshotFolders = appState.folders;
+        const snapshotVideos = appState.videos;
+        const snapshotPath = appState.selectionPath;
+
+        await deleteFolder(id);
+        await appState.refreshFolders();
+        await appState.refreshVideos();
+
+        const idx = appState.selectionPath.indexOf(id);
+        if (idx !== -1) {
+            const newPath = appState.selectionPath.slice(0, idx);
+            appState.openFolder(newPath);
+        }
+
+        appState.showUndo(`Deleted folder "${folder.name}"`, async () => {
+            await restoreFolder(id);
+            appState.folders = snapshotFolders;
+            appState.videos = snapshotVideos;
+            appState.openFolder(snapshotPath);
             await appState.refreshFolders();
             await appState.refreshVideos();
-
-            // If the deleted folder was in our path, we must go up.
-            const idx = appState.selectionPath.indexOf(id);
-            if (idx !== -1) {
-                const newPath = appState.selectionPath.slice(0, idx);
-                appState.openFolder(newPath);
-            }
-        }
+        });
     }
 
     async function handleDeleteVideo(id: string, e: MouseEvent) {
         e.stopPropagation();
-        if (confirm("Delete video and all its clips?")) {
-            await deleteVideo(id);
+        const video = appState.videos.find((v) => v.id === id);
+        if (!video) return;
+
+        const snapshot = appState.videos;
+
+        await deleteVideo(id);
+        await appState.refreshVideos();
+
+        appState.showUndo(`Deleted video "${video.title}"`, async () => {
+            await restoreVideo(id);
+            appState.videos = snapshot;
             await appState.refreshVideos();
-        }
+        });
     }
 
     // Drag & Drop
@@ -380,8 +558,7 @@
     }
 </script>
 
-<div class="h-full flex flex-col bg-black overflow-hidden">
-    <!-- Miller Columns Container -->
+<div class="h-full flex flex-col bg-black overflow-hidden" class:bg-[color:var(--surface)]={compact}>
     <div class="flex-1 flex overflow-x-auto overflow-y-hidden bg-black border-b border-zinc-900">
         {#each columns as col, depth}
             <div
@@ -402,7 +579,6 @@
                 aria-label="Column {depth} (Click to Deselect)"
                 tabindex="0"
             >
-                <!-- Folders List -->
                 {#each col.folders as folder (folder.id)}
                     <div
                         role="button"
@@ -416,6 +592,44 @@
                         onkeydown={(e) =>
                             e.key === "Enter" &&
                             selectFolder(folder.id!, depth)}
+                        ontouchstart={(e) => startLongPress(folder, e)}
+                        ontouchend={cancelLongPress}
+                        ontouchmove={cancelLongPress}
+                        oncontextmenu={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            appState.contextMenu = {
+                                x: e.clientX,
+                                y: e.clientY,
+                                show: true,
+                                items: [
+                                    {
+                                        label: "Open",
+                                        action: () => selectFolder(folder.id!, depth),
+                                    },
+                                    {
+                                        label: "Rename",
+                                        action: () => startRenameFolder(folder),
+                                    },
+                                    {
+                                        label: "Move to…",
+                                        action: () => {
+                                            folderPickerTitle = `Move folder "${folder.name}"`;
+                                            folderPickerExcludedFolder = folder.id;
+                                            if (folderPickerRef) {
+                                                folderPickerRef.moveFolder(folder);
+                                            }
+                                            isFolderPickerOpen = true;
+                                        },
+                                    },
+                                    {
+                                        label: "Delete",
+                                        danger: true,
+                                        action: () => handleDeleteFolder(folder.id!, new MouseEvent("click")),
+                                    },
+                                ],
+                            };
+                        }}
                         ondragover={(e) =>
                             handleDragOverItem(e, folder.id!, "folder")}
                         ondragleave={(e) => handleDragLeaveItem(e, folder.id!)}
@@ -438,43 +652,38 @@
                             ? '!border-b-4 !border-blue-500 z-10'
                             : 'border-b-2 border-transparent'}"
                     >
-                        <div
-                            class="flex items-center gap-2 truncate pointer-events-none"
-                        >
-                            <svg
-                                class="size-4 opacity-70 flex-shrink-0"
-                                fill="currentColor"
-                                viewBox="0 0 24 24"
-                                ><path
-                                    d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
-                                /></svg
+                        {#if renamingFolder?.id === folder.id}
+                            <input
+                                bind:value={renamingText}
+                                class="flex-1 bg-zinc-900 border border-blue-500 rounded px-2 py-1 text-sm text-white outline-none"
+                                use:focusOnMount
+                                onkeydown={(e) => {
+                                    if (e.key === "Enter") commitRename();
+                                    else if (e.key === "Escape") cancelRename();
+                                }}
+                                onblur={commitRename}
+                                onclick={(e) => e.stopPropagation()}
+                                onmousedown={(e) => e.stopPropagation()}
+                            />
+                        {:else}
+                            <div
+                                class="flex items-center gap-2 truncate pointer-events-none"
                             >
-                            <span class="truncate text-sm">{folder.name}</span>
-                        </div>
-
-                        <div class="flex items-center pointer-events-auto">
-                            {#if appState.selectionPath.includes(folder.id!)}
                                 <svg
-                                    class="size-4 opacity-50"
-                                    fill="none"
+                                    class="size-4 opacity-70 flex-shrink-0"
+                                    fill="currentColor"
                                     viewBox="0 0 24 24"
-                                    stroke="currentColor"
                                     ><path
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        stroke-width="2"
-                                        d="M9 5l7 7-7 7"
+                                        d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
                                     /></svg
                                 >
-                            {:else}
-                                <button
-                                    onclick={(e) =>
-                                        handleDeleteFolder(folder.id!, e)}
-                                    class="p-1 hover:bg-black/20 rounded mr-1 opacity-50 hover:opacity-100 transition-opacity"
-                                    aria-label="Delete Folder"
-                                >
+                                <span class="truncate text-sm">{folder.name}</span>
+                            </div>
+
+                            <div class="flex items-center pointer-events-auto">
+                                {#if appState.selectionPath.includes(folder.id!)}
                                     <svg
-                                        class="size-3"
+                                        class="size-4 opacity-50"
                                         fill="none"
                                         viewBox="0 0 24 24"
                                         stroke="currentColor"
@@ -482,16 +691,35 @@
                                             stroke-linecap="round"
                                             stroke-linejoin="round"
                                             stroke-width="2"
-                                            d="M6 18L18 6M6 6l12 12"
+                                            d="M9 5l7 7-7 7"
                                         /></svg
                                     >
-                                </button>
-                            {/if}
-                        </div>
+                                {:else}
+                                    <button
+                                        onclick={(e) =>
+                                            handleDeleteFolder(folder.id!, e)}
+                                        class="p-1 hover:bg-black/20 rounded mr-1 opacity-50 hover:opacity-100 transition-opacity"
+                                        aria-label="Delete Folder"
+                                    >
+                                        <svg
+                                            class="size-3"
+                                            fill="none"
+                                            viewBox="0 0 24 24"
+                                            stroke="currentColor"
+                                            ><path
+                                                stroke-linecap="round"
+                                                stroke-linejoin="round"
+                                                stroke-width="2"
+                                                d="M6 18L18 6M6 6l12 12"
+                                            /></svg
+                                        >
+                                    </button>
+                                {/if}
+                            </div>
+                        {/if}
                     </div>
                 {/each}
 
-                <!-- Videos -->
                 {#each col.videos as video (video.id)}
                     <div
                         role="button"
@@ -504,6 +732,48 @@
                         }}
                         onkeydown={(e) =>
                             e.key === "Enter" && appState.openVideo(video)}
+                        ontouchstart={(e) => startLongPress(video, e)}
+                        ontouchend={cancelLongPress}
+                        ontouchmove={cancelLongPress}
+                        oncontextmenu={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            appState.contextMenu = {
+                                x: e.clientX,
+                                y: e.clientY,
+                                show: true,
+                                items: [
+                                    {
+                                        label: "Play",
+                                        action: () => appState.openVideo(video),
+                                    },
+                                    {
+                                        label: "Rename",
+                                        action: () => startRenameVideo(video),
+                                    },
+                                    {
+                                        label: "Edit Trim…",
+                                        action: () => openVideoEdit(video),
+                                    },
+                                    {
+                                        label: "Move to…",
+                                        action: () => {
+                                            folderPickerTitle = `Move "${video.title}"`;
+                                            folderPickerExcludedFolder = undefined;
+                                            if (folderPickerRef) {
+                                                folderPickerRef.moveVideo(video);
+                                            }
+                                            isFolderPickerOpen = true;
+                                        },
+                                    },
+                                    {
+                                        label: "Delete",
+                                        danger: true,
+                                        action: () => handleDeleteVideo(video.id!, new MouseEvent("click")),
+                                    },
+                                ],
+                            };
+                        }}
                         ondragover={(e) =>
                             handleDragOverItem(e, video.id!, "video")}
                         ondragleave={(e) => handleDragLeaveItem(e, video.id!)}
@@ -519,44 +789,63 @@
                             ? '!border-b-4 !border-blue-500 z-10'
                             : 'border-b-2 border-transparent'}"
                     >
-                        <!-- Video Drop Zone (Implicit: Drop on Video = Reorder Before) -->
-
-                        <div
-                            class="flex items-center gap-2 truncate flex-1 pointer-events-none"
-                        >
-                            <img
-                                src={video.thumbnail_url}
-                                alt=""
-                                class="w-8 h-5 object-cover rounded bg-zinc-800"
+                        {#if renamingVideo?.id === video.id}
+                            <input
+                                bind:value={renamingText}
+                                class="flex-1 bg-zinc-900 border border-blue-500 rounded px-2 py-1 text-sm text-white outline-none"
+                                use:focusOnMount
+                                onkeydown={(e) => {
+                                    if (e.key === "Enter") commitRename();
+                                    else if (e.key === "Escape") cancelRename();
+                                }}
+                                onblur={commitRename}
+                                onclick={(e) => e.stopPropagation()}
+                                onmousedown={(e) => e.stopPropagation()}
                             />
-                            <span class="truncate text-sm font-medium"
-                                >{video.title}</span
+                        {:else}
+                            <div
+                                class="flex items-center gap-2 truncate flex-1 pointer-events-none"
                             >
-                            <span class="text-xs text-zinc-600"
-                                >{video.last_position > 0 ? formatTime(video.last_position) : (video.duration > 0 ? formatTime(video.duration) : "")}</span
-                            >
-                        </div>
-
-                        <div class="flex items-center pointer-events-auto">
-                            <button
-                                onclick={(e) => handleDeleteVideo(video.id!, e)}
-                                class="p-1 hover:bg-black/20 rounded mr-1 opacity-50 hover:opacity-100 transition-opacity"
-                                aria-label="Delete Video"
-                            >
-                                <svg
-                                    class="size-3"
-                                    fill="none"
-                                    viewBox="0 0 24 24"
-                                    stroke="currentColor"
-                                    ><path
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        stroke-width="2"
-                                        d="M6 18L18 6M6 6l12 12"
-                                    /></svg
+                                <Thumbnail
+                                    videoId={video.id}
+                                    alt=""
+                                    className="w-8 h-5 object-cover rounded bg-zinc-800 shrink-0"
+                                />
+                                <span class="truncate text-sm font-medium"
+                                    >{video.title}</span
                                 >
-                            </button>
-                        </div>
+                                <span class="text-xs text-zinc-600"
+                                    >{#if video.last_position > 0}
+                                        ▶ {formatTime(video.last_position)}
+                                    {:else if video.duration > 0}
+                                        {formatTime(video.duration)}
+                                    {:else}
+                                        New
+                                    {/if}</span
+                                >
+                            </div>
+
+                            <div class="flex items-center pointer-events-auto">
+                                <button
+                                    onclick={(e) => handleDeleteVideo(video.id!, e)}
+                                    class="p-1 hover:bg-black/20 rounded mr-1 opacity-50 hover:opacity-100 transition-opacity"
+                                    aria-label="Delete Video"
+                                >
+                                    <svg
+                                        class="size-3"
+                                        fill="none"
+                                        viewBox="0 0 24 24"
+                                        stroke="currentColor"
+                                        ><path
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                            stroke-width="2"
+                                            d="M6 18L18 6M6 6l12 12"
+                                        /></svg
+                                    >
+                                </button>
+                            </div>
+                        {/if}
                     </div>
                 {/each}
 
@@ -571,10 +860,27 @@
         {/each}
     </div>
 
-    <!-- Header Controls (Footer) -->
-    <div
-        class="min-h-12 flex items-center justify-between px-4 border-t border-zinc-800 bg-zinc-900 select-none grid-area-footer flex-wrap gap-2"
-    >
+<div
+    class="min-h-12 flex items-center justify-between px-4 border-t border-zinc-800 bg-zinc-900 select-none grid-area-footer flex-wrap gap-2"
+>
+    {#if creatingFolder}
+        <div class="flex items-center gap-2 flex-1 min-w-[200px]">
+            <input
+                bind:value={newFolderName}
+                placeholder="New folder name"
+                class="flex-1 min-w-0 bg-zinc-950 border border-blue-500 rounded px-2 py-1 text-sm text-white outline-none"
+                use:focusOnMount
+                onkeydown={(e) => {
+                    if (e.key === "Enter") commitCreateFolder();
+                    else if (e.key === "Escape") {
+                        creatingFolder = false;
+                        newFolderName = "";
+                    }
+                }}
+                onblur={commitCreateFolder}
+            />
+        </div>
+    {:else}
         <div class="flex items-center gap-2 overflow-hidden">
             <button
                 onclick={() => appState.openFolder([])}
@@ -613,7 +919,6 @@
         </div>
 
         <div class="flex gap-4 items-center">
-            <!-- Sync Status -->
             {#if appState.syncStatus === "syncing"}
                 <div class="flex items-center gap-2 text-xs text-blue-500">
                     <svg
@@ -691,7 +996,7 @@
                         /></svg
                     >
                 </button>
-                {#if appState.settings.githubToken && appState.settings.githubRepo}
+                {#if appState.settings.githubTokenPresent && appState.settings.githubRepo}
                     <button
                         onclick={() => appState.triggerSync()}
                         disabled={appState.syncStatus === "syncing"}
@@ -751,5 +1056,14 @@
                 </button>
             </div>
         </div>
+    {/if}
     </div>
 </div>
+
+<FolderPicker
+    bind:this={folderPickerRef}
+    open={isFolderPickerOpen}
+    title={folderPickerTitle}
+    excludeFolderId={folderPickerExcludedFolder}
+    onClose={() => (isFolderPickerOpen = false)}
+/>

@@ -1,6 +1,6 @@
 <script lang="ts">
     import { appState } from "./state.svelte";
-    import { saveVideo, type Video } from "./db";
+    import { saveVideo, fetchVideoOembed, type Video } from "./db";
 
     let { folderId = null } = $props<{ folderId?: number | null }>();
 
@@ -11,41 +11,49 @@
     let loading = $state(false);
     let error = $state("");
 
+    function extractVideoId(input: string): string | null {
+        const trimmed = input.trim();
+        if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
+        try {
+            const urlObj = new URL(trimmed);
+            const host = urlObj.hostname.replace(/^www\./, "").replace(/^m\./, "");
+            if (host === "youtu.be") {
+                const id = urlObj.pathname.slice(1).split("/")[0];
+                return /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
+            }
+            if (host.endsWith("youtube.com") || host.endsWith("youtube-nocookie.com")) {
+                const v = urlObj.searchParams.get("v");
+                if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+                const parts = urlObj.pathname.split("/").filter(Boolean);
+                const idx = parts.findIndex((p) => ["embed", "v", "shorts", "live"].includes(p));
+                if (idx >= 0 && parts[idx + 1] && /^[a-zA-Z0-9_-]{11}$/.test(parts[idx + 1])) {
+                    return parts[idx + 1];
+                }
+            }
+        } catch {
+            // not a URL
+        }
+        return null;
+    }
+
     async function handleSubmit() {
         loading = true;
         error = "";
         try {
-            let videoId = "";
-            try {
-                const urlObj = new URL(url);
-                if (urlObj.hostname.includes("youtube.com")) {
-                    videoId = urlObj.searchParams.get("v") || "";
-                } else if (urlObj.hostname.includes("youtu.be")) {
-                    videoId = urlObj.pathname.slice(1);
-                }
-            } catch (e) {
-                if (url.length === 11) videoId = url;
-            }
-
-            if (!videoId) throw new Error("Invalid URL");
+            const videoId = extractVideoId(url);
+            if (!videoId) throw new Error("Invalid YouTube URL or ID");
 
             let title = customTitle.trim();
-            let thumbnail_url = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
 
             if (!title) {
                 try {
-                    const response = await fetch(
-                        `https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`,
-                    );
-                    if (!response.ok) {
-                        throw new Error(`HTTP error: ${response.status}`);
+                    const oembed = await fetchVideoOembed(videoId);
+                    if (oembed?.title) {
+                        title = oembed.title;
+                    } else {
+                        title = `Video ${videoId}`;
                     }
-                    const data = await response.json();
-                    if (!data.title)
-                        throw new Error("Could not fetch video metadata");
-                    title = data.title;
-                    thumbnail_url = data.thumbnail_url || thumbnail_url;
-                } catch (fetchErr: any) {
+                } catch {
                     title = `Video ${videoId}`;
                 }
             }
@@ -56,7 +64,7 @@
             const video: Video = {
                 id: videoId,
                 title: title,
-                thumbnail_url: thumbnail_url,
+                thumbnail_url: "",
                 duration: 0,
                 last_position: 0,
                 created_at: Date.now(),

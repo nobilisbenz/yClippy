@@ -97,6 +97,18 @@ $: activeVideos = videos.filter(v => v.id);
 ```typescript
 // Good - using $lib alias
 import { getVideos } from '$lib/db';
+```
+
+### Android build notes
+
+`src-tauri/gen/android` is tracked in this repository. `MainActivity.kt` is hand-written and `tauri android init` will clobber it. If you regenerate the Android project, re-apply:
+
+- `yclippy://` deep-link `intent-filter` and `ACTION_VIEW` for `youtube.com`/`youtu.be`/`m.youtube.com`
+- `text/*` (not just `text/plain`) `ACTION_SEND` filter
+- The `yclippy://play?v=…&t=…` parsing in `handleViewIntent`
+- The timestamp-aware `openInRevanced(videoId, startSeconds)` overload
+
+The split `src-tauri/capabilities/desktop.json` and `mobile.json` are also committed — both are referenced by `tauri android build` and `cargo tauri build` respectively.
 import type { Video } from '$lib/db';
 
 // Good - relative imports also work

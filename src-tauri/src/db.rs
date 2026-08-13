@@ -1,63 +1,42 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(dead_code)]
 pub struct YtRenamerData {
     pub clips: Vec<YtRenamerClip>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(dead_code)]
 pub struct YtRenamerClip {
     pub start_time: f64,
     pub end_time: f64,
     pub title: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-pub enum ChangeType {
-    Create,
-    Update,
-    Delete,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-pub struct Change {
-    pub id: i64,
-    pub entity_type: String,
-    pub entity_id: String,
-    pub change_type: ChangeType,
-    pub data: String,
-    pub timestamp: i64,
-    pub device_id: String,
-    pub synced: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-pub struct SyncMetadata {
-    pub last_sync_timestamp: i64,
-    pub last_sync_device: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-pub struct ChangeSet {
-    pub changes: Vec<Change>,
-    pub metadata: SyncMetadata,
-    pub device_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct AppConfig {
     db_path: Option<String>,
+    github_token: Option<String>,
+    github_repo: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct StoredConfig {
+    pub github_token: Option<String>,
+    pub github_repo: Option<String>,
+}
+
+pub fn load_config_pub(app: &AppHandle) -> StoredConfig {
+    let cfg = load_config(app);
+    StoredConfig {
+        github_token: cfg.github_token,
+        github_repo: cfg.github_repo,
+    }
 }
 
 fn get_config_path(app: &AppHandle) -> PathBuf {
@@ -71,16 +50,24 @@ fn load_config(app: &AppHandle) -> AppConfig {
     let config_path = get_config_path(app);
     if config_path.exists() {
         let content = fs::read_to_string(config_path).unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or(AppConfig { db_path: None })
+        serde_json::from_str(&content).unwrap_or_default()
     } else {
-        AppConfig { db_path: None }
+        AppConfig::default()
     }
 }
 
 fn save_config(app: &AppHandle, config: &AppConfig) {
     let config_path = get_config_path(app);
-    let content = serde_json::to_string_pretty(config).expect("failed to serialize config");
-    fs::write(config_path, content).expect("failed to write config");
+    let content = match serde_json::to_string_pretty(config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to serialize config: {e}");
+            return;
+        }
+    };
+    if let Err(e) = fs::write(&config_path, content) {
+        eprintln!("failed to write config to {config_path:?}: {e}");
+    }
 }
 
 fn current_time() -> i64 {
@@ -125,6 +112,7 @@ fn setup_db(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS clips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT UNIQUE,
             video_id TEXT,
             start_time INTEGER,
             end_time INTEGER,
@@ -138,7 +126,12 @@ fn setup_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Migration for existing clips
+    let _ = conn.execute("ALTER TABLE clips ADD COLUMN uid TEXT", []);
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_uid ON clips(uid)",
+        [],
+    )?;
+
     let _ = conn.execute(
         "ALTER TABLE clips ADD COLUMN updated_at INTEGER DEFAULT 0",
         [],
@@ -152,6 +145,7 @@ fn setup_db(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS folders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT UNIQUE,
             name TEXT NOT NULL,
             created_at INTEGER,
             updated_at INTEGER DEFAULT 0,
@@ -162,7 +156,12 @@ fn setup_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Migration for existing folders
+    let _ = conn.execute("ALTER TABLE folders ADD COLUMN uid TEXT", []);
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_uid ON folders(uid)",
+        [],
+    )?;
+
     let _ = conn.execute("ALTER TABLE folders ADD COLUMN parent_id INTEGER", []);
     let _ = conn.execute(
         "ALTER TABLE folders ADD COLUMN updated_at INTEGER DEFAULT 0",
@@ -182,20 +181,45 @@ fn setup_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Deprecated but kept for compatibility during migration if needed
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS changes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_type TEXT NOT NULL,
-            entity_id TEXT NOT NULL,
-            change_type TEXT NOT NULL,
-            data TEXT,
-            timestamp INTEGER NOT NULL,
-            device_id TEXT NOT NULL,
-            synced INTEGER DEFAULT 0
-        )",
-        [],
-    )?;
+    backfill_uids(conn)?;
+
+    Ok(())
+}
+
+fn backfill_uids(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM folders WHERE uid IS NULL OR uid = ''")
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let folder_ids: Vec<i64> = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    for id in folder_ids {
+        let uid = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "UPDATE folders SET uid = ?1 WHERE id = ?2",
+            params![uid, id],
+        )?;
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM clips WHERE uid IS NULL OR uid = ''")
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let clip_ids: Vec<i64> = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    for id in clip_ids {
+        let uid = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "UPDATE clips SET uid = ?1 WHERE id = ?2",
+            params![uid, id],
+        )?;
+    }
 
     Ok(())
 }
@@ -221,6 +245,8 @@ pub struct Video {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Clip {
     pub id: Option<i32>,
+    #[serde(default)]
+    pub uid: Option<String>,
     pub video_id: String,
     pub start_time: i32,
     pub end_time: i32,
@@ -258,12 +284,20 @@ pub fn init_db(app: &AppHandle) -> Result<DbState> {
     let conn = Connection::open(db_path)?;
     setup_db(&conn)?;
 
-    let device_id = uuid::Uuid::new_v4().to_string();
-
-    let _: Result<_> = conn.execute(
-        "INSERT OR IGNORE INTO sync_metadata (key, value) VALUES ('device_id', ?1)",
-        params![device_id],
-    );
+    let device_id: String = conn
+        .query_row(
+            "SELECT value FROM sync_metadata WHERE key = 'device_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| {
+            let new_id = uuid::Uuid::new_v4().to_string();
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('device_id', ?1)",
+                params![new_id],
+            );
+            new_id
+        });
 
     Ok(DbState {
         conn: Mutex::new(conn),
@@ -287,34 +321,89 @@ pub fn get_db_path(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 pub fn set_db_path(app: AppHandle, state: State<DbState>, path: String) -> Result<(), String> {
-    // 1. Verify path is valid/accessible
     let new_path = PathBuf::from(&path);
-    // If directory doesn't exist, maybe create it? For now assume valid path selection.
+    if let Some(parent) = new_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(format!(
+                "Parent directory does not exist: {}",
+                parent.display()
+            ));
+        }
+    }
 
-    // 2. Open new connection
+    let test_conn = Connection::open(&new_path).map_err(|e| e.to_string())?;
+    setup_db(&test_conn).map_err(|e| e.to_string())?;
+    drop(test_conn);
+
     let conn = Connection::open(&new_path).map_err(|e| e.to_string())?;
 
-    // 3. Run migrations
-    setup_db(&conn).map_err(|e| e.to_string())?;
-
-    // 4. Update Global State (Mutex)
     {
         let mut global_conn = state.conn.lock().unwrap();
         *global_conn = conn;
     }
 
-    // 5. Save Config
-    let config = AppConfig {
-        db_path: Some(path),
-    };
+    let mut config = load_config(&app);
+    config.db_path = Some(path);
     save_config(&app, &config);
 
     Ok(())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GithubConfigPublic {
+    pub github_repo: String,
+    pub token_present: bool,
+}
+
+#[tauri::command]
+pub fn get_github_config(app: AppHandle) -> Result<GithubConfigPublic, String> {
+    let config = load_config(&app);
+    Ok(GithubConfigPublic {
+        github_repo: config.github_repo.unwrap_or_default(),
+        token_present: config
+            .github_token
+            .as_ref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false),
+    })
+}
+
+#[tauri::command]
+pub fn set_github_config(
+    app: AppHandle,
+    github_repo: String,
+    github_token: Option<String>,
+) -> Result<(), String> {
+    let mut config = load_config(&app);
+    config.github_repo = if github_repo.is_empty() {
+        None
+    } else {
+        Some(github_repo)
+    };
+    if let Some(token) = github_token {
+        config.github_token = if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        };
+    }
+    save_config(&app, &config);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_github_token(app: AppHandle) -> Result<(), String> {
+    let mut config = load_config(&app);
+    config.github_token = None;
+    save_config(&app, &config);
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Folder {
     pub id: Option<i64>,
+    #[serde(default)]
+    pub uid: Option<String>,
     pub name: String,
     pub created_at: i64,
     #[serde(default)]
@@ -330,19 +419,20 @@ pub struct Folder {
 pub fn get_folders(state: State<DbState>) -> Result<Vec<Folder>, String> {
     let conn = state.conn.lock().unwrap();
     let mut stmt = conn
-        .prepare("SELECT id, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders WHERE deleted_at IS NULL ORDER BY created_at DESC")
+        .prepare("SELECT id, uid, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders WHERE deleted_at IS NULL ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let iter = stmt
         .query_map([], |row| {
             Ok(Folder {
                 id: row.get(0)?,
-                name: row.get(1)?,
-                created_at: row.get(2)?,
-                updated_at: row.get(3)?,
-                deleted_at: row.get(4)?,
-                sort_order: row.get(5)?,
-                parent_id: row.get(6)?,
+                uid: row.get(1)?,
+                name: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                deleted_at: row.get(5)?,
+                sort_order: row.get(6)?,
+                parent_id: row.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -355,26 +445,47 @@ pub fn get_folders(state: State<DbState>) -> Result<Vec<Folder>, String> {
 }
 
 #[tauri::command]
-pub fn save_folder(state: State<DbState>, folder: Folder) -> Result<i64, String> {
+pub fn save_folder(state: State<DbState>, app: AppHandle, folder: Folder) -> Result<i64, String> {
     let conn = state.conn.lock().unwrap();
     let now = current_time();
 
-    if let Some(_id) = folder.id {
-        // Record change commented out for now as we transition to new sync engine
-        // match record_change(&conn, "folder", &id.to_string(), ChangeType::Update) { ... }
-    }
+    let uid = match folder.uid.clone().filter(|s| !s.is_empty()) {
+        Some(u) => u,
+        None => uuid::Uuid::new_v4().to_string(),
+    };
 
-    conn.execute(
-        "INSERT OR REPLACE INTO folders (id, name, created_at, updated_at, deleted_at, sort_order, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![folder.id, folder.name, folder.created_at, now, folder.deleted_at, folder.sort_order, folder.parent_id],
-    )
-    .map_err(|e| e.to_string())?;
-
-    if let Some(id) = folder.id {
-        Ok(id)
+    let id = if let Some(existing_id) = folder.id {
+        conn.execute(
+            "UPDATE folders SET name = ?1, uid = ?2, updated_at = ?3, deleted_at = ?4, sort_order = ?5, parent_id = ?6 WHERE id = ?7",
+            params![folder.name, uid, now, folder.deleted_at, folder.sort_order, folder.parent_id, existing_id],
+        )
+        .map_err(|e| e.to_string())?;
+        existing_id
     } else {
-        Ok(conn.last_insert_rowid())
-    }
+        conn.execute(
+            "INSERT INTO folders (uid, name, created_at, updated_at, deleted_at, sort_order, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![uid, folder.name, folder.created_at, now, folder.deleted_at, folder.sort_order, folder.parent_id],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.last_insert_rowid()
+    };
+
+    drop(conn);
+
+    let snapshot = crate::db::Folder {
+        id: Some(id),
+        uid: Some(uid.clone()),
+        name: folder.name.clone(),
+        created_at: folder.created_at,
+        updated_at: now,
+        deleted_at: folder.deleted_at,
+        sort_order: folder.sort_order,
+        parent_id: folder.parent_id,
+    };
+    let fields = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+    let _ = crate::oplog::append_upsert(&app, "folder", &uid, fields);
+
+    Ok(id)
 }
 
 #[tauri::command]
@@ -394,38 +505,23 @@ pub fn update_folder_parent(
 }
 
 #[tauri::command]
-pub fn delete_folder(state: State<DbState>, id: i64) -> Result<(), String> {
+pub fn delete_folder(state: State<DbState>, app: AppHandle, id: i64) -> Result<(), String> {
     let conn = state.conn.lock().unwrap();
     let now = current_time();
 
-    // Soft delete: set deleted_at instead of removing
+    let uid: Option<String> = conn
+        .query_row(
+            "SELECT uid FROM folders WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok();
+
     conn.execute(
         "UPDATE folders SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1",
         params![id, now],
     )
     .map_err(|e| e.to_string())?;
-
-    // Also soft delete items in this folder or move them?
-    // Plan says "Apply soft deletes (remove items where deleted_at is set)" -> wait, logic says "Update local: apply soft deletes".
-    // Usually if you delete a folder, you might want to soft delete contents too.
-    // However, existing logic just unparented children (moved to root).
-    // "UPDATE videos SET folder_id = ?2 WHERE folder_id = ?1" -> parent_id
-    // Previous logic was: move children to grandparent.
-
-    // For soft delete, maybe we should keep structure?
-    // If we mark folder as deleted, we can't see it, but we can see its children if they are not deleted?
-    // Let's stick to previous logic of re-parenting for now to avoid orphaned invisible items,
-    // OR we soft-delete everything inside.
-
-    // Previous logic:
-    // let parent_id: Option<i64> = conn.query_row(...).unwrap_or(None);
-    // conn.execute("UPDATE videos SET folder_id = ?2 ...", ...)?;
-    // conn.execute("UPDATE folders SET parent_id = ?2 ...", ...)?;
-    // conn.execute("DELETE FROM folders ...")?;
-
-    // New logic: Soft delete the folder.
-    // Ideally we should soft-delete children too?
-    // Or move them to root? Moving to root/grandparent is safer for user data retention.
 
     let parent_id: Option<i64> = conn
         .query_row(
@@ -436,7 +532,6 @@ pub fn delete_folder(state: State<DbState>, id: i64) -> Result<(), String> {
         .optional()
         .unwrap_or(None);
 
-    // Update children to point to grandparent (or root) and update their timestamp
     conn.execute(
         "UPDATE videos SET folder_id = ?2, updated_at = ?3 WHERE folder_id = ?1",
         params![id, parent_id, now],
@@ -448,6 +543,10 @@ pub fn delete_folder(state: State<DbState>, id: i64) -> Result<(), String> {
         params![id, parent_id, now],
     )
     .map_err(|e| e.to_string())?;
+
+    if let Some(uid) = uid {
+        let _ = crate::oplog::append_delete(&app, "folder", &uid);
+    }
 
     Ok(())
 }
@@ -500,7 +599,7 @@ pub fn get_videos(state: State<DbState>) -> Result<Vec<Video>, String> {
 }
 
 #[tauri::command]
-pub fn save_video(state: State<DbState>, video: Video) -> Result<(), String> {
+pub fn save_video(state: State<DbState>, app: AppHandle, video: Video) -> Result<(), String> {
     let folder_id = if video.folder_id == Some(0) {
         None
     } else {
@@ -509,34 +608,50 @@ pub fn save_video(state: State<DbState>, video: Video) -> Result<(), String> {
     let conn = state.conn.lock().unwrap();
     let now = current_time();
 
-    // Check if exists for accurate created_at if needed, but we trust input video struct
-    // Actually, we should probably preserve created_at from DB if it exists and input is 0?
-    // But usually frontend sends correct full object.
-
     conn.execute(
-        "INSERT OR REPLACE INTO videos (id, title, thumbnail_url, duration, last_position, created_at, updated_at, deleted_at, folder_id, start_time, end_time, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO videos (id, title, thumbnail_url, duration, last_position, created_at, updated_at, deleted_at, folder_id, start_time, end_time, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO UPDATE SET title = COALESCE(NULLIF(excluded.title, ''), videos.title), thumbnail_url = COALESCE(NULLIF(excluded.thumbnail_url, ''), videos.thumbnail_url), updated_at = excluded.updated_at, deleted_at = excluded.deleted_at, folder_id = excluded.folder_id, start_time = excluded.start_time, end_time = excluded.end_time, sort_order = excluded.sort_order",
         params![video.id, video.title, video.thumbnail_url, video.duration, video.last_position, video.created_at, now, video.deleted_at, folder_id, video.start_time, video.end_time, video.sort_order],
     ).map_err(|e| e.to_string())?;
+    drop(conn);
+
+    let snapshot = crate::db::Video {
+        id: video.id.clone(),
+        title: video.title.clone(),
+        thumbnail_url: video.thumbnail_url.clone(),
+        duration: video.duration,
+        last_position: video.last_position,
+        created_at: video.created_at,
+        updated_at: now,
+        deleted_at: video.deleted_at,
+        folder_id,
+        start_time: video.start_time,
+        end_time: video.end_time,
+        sort_order: video.sort_order,
+    };
+    let fields = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+    let _ = crate::oplog::append_upsert(&app, "video", &video.id, fields);
+
     Ok(())
 }
 
 #[tauri::command]
 pub fn get_clips(state: State<DbState>, video_id: String) -> Result<Vec<Clip>, String> {
     let conn = state.conn.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT id, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips WHERE video_id = ?1 AND deleted_at IS NULL ORDER BY sort_order ASC").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT id, uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips WHERE video_id = ?1 AND deleted_at IS NULL ORDER BY sort_order ASC").map_err(|e| e.to_string())?;
 
     let clip_iter = stmt
         .query_map(params![video_id], |row| {
             Ok(Clip {
                 id: row.get(0)?,
-                video_id: row.get(1)?,
-                start_time: row.get(2)?,
-                end_time: row.get(3)?,
-                title: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                deleted_at: row.get(7)?,
-                sort_order: row.get(8)?,
+                uid: row.get(1)?,
+                video_id: row.get(2)?,
+                start_time: row.get(3)?,
+                end_time: row.get(4)?,
+                title: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                deleted_at: row.get(8)?,
+                sort_order: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -549,15 +664,25 @@ pub fn get_clips(state: State<DbState>, video_id: String) -> Result<Vec<Clip>, S
 }
 
 #[tauri::command]
-pub fn save_clip(state: State<DbState>, clip: Clip) -> Result<(), String> {
+pub fn save_clip(state: State<DbState>, app: AppHandle, clip: Clip) -> Result<(), String> {
     let conn = state.conn.lock().unwrap();
     let now = current_time();
 
-    if let Some(id) = clip.id {
+    let (id, uid) = if let Some(id) = clip.id {
+        let uid = match clip.uid.clone().filter(|s| !s.is_empty()) {
+            Some(u) => u,
+            None => {
+                let existing: Option<String> = conn
+                    .query_row("SELECT uid FROM clips WHERE id = ?1", params![id], |row| row.get(0))
+                    .ok();
+                existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            }
+        };
         conn.execute(
-            "UPDATE clips SET video_id = ?1, start_time = ?2, end_time = ?3, title = ?4, updated_at = ?5, sort_order = ?6 WHERE id = ?7",
-            params![clip.video_id, clip.start_time, clip.end_time, clip.title, now, clip.sort_order, id],
+            "UPDATE clips SET uid = ?1, video_id = ?2, start_time = ?3, end_time = ?4, title = ?5, updated_at = ?6, sort_order = ?7 WHERE id = ?8",
+            params![uid, clip.video_id, clip.start_time, clip.end_time, clip.title, now, clip.sort_order, id],
         ).map_err(|e| e.to_string())?;
+        (id, uid)
     } else {
         let max_order: Option<i32> = conn
             .query_row(
@@ -567,23 +692,55 @@ pub fn save_clip(state: State<DbState>, clip: Clip) -> Result<(), String> {
             )
             .ok();
         let new_sort_order = max_order.unwrap_or(-1) + 1;
+        let uid = uuid::Uuid::new_v4().to_string();
         conn.execute(
-            "INSERT INTO clips (video_id, start_time, end_time, title, created_at, updated_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
-            params![clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, new_sort_order],
+            "INSERT INTO clips (uid, video_id, start_time, end_time, title, created_at, updated_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+            params![uid, clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, new_sort_order],
         ).map_err(|e| e.to_string())?;
-    }
+        (conn.last_insert_rowid() as i32, uid)
+    };
+    drop(conn);
+
+    let snapshot = crate::db::Clip {
+        id: Some(id),
+        uid: Some(uid.clone()),
+        video_id: clip.video_id.clone(),
+        start_time: clip.start_time,
+        end_time: clip.end_time,
+        title: clip.title.clone(),
+        created_at: clip.created_at,
+        updated_at: now,
+        deleted_at: clip.deleted_at,
+        sort_order: clip.sort_order,
+    };
+    let fields = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+    let _ = crate::oplog::append_upsert(&app, "clip", &uid, fields);
+
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_clip(state: State<DbState>, id: i32) -> Result<(), String> {
+pub fn delete_clip(state: State<DbState>, app: AppHandle, id: i32) -> Result<(), String> {
     let conn = state.conn.lock().unwrap();
     let now = current_time();
+
+    let uid: Option<String> = conn
+        .query_row(
+            "SELECT uid FROM clips WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok();
+
     conn.execute(
         "UPDATE clips SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1",
         params![id, now],
     )
     .map_err(|e| e.to_string())?;
+
+    if let Some(uid) = uid {
+        let _ = crate::oplog::append_delete(&app, "clip", &uid);
+    }
     Ok(())
 }
 
@@ -642,24 +799,23 @@ pub fn rename_clip(state: State<DbState>, id: i32, title: String) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn delete_video(state: State<DbState>, id: String) -> Result<(), String> {
+pub fn delete_video(state: State<DbState>, app: AppHandle, id: String) -> Result<(), String> {
     let conn = state.conn.lock().unwrap();
     let now = current_time();
 
-    // Soft delete video
     conn.execute(
         "UPDATE videos SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1",
-        params![id, now],
+        params![id.clone(), now],
     )
     .map_err(|e| e.to_string())?;
 
-    // Soft delete associated clips?
-    // Yes, usually.
     conn.execute(
         "UPDATE clips SET deleted_at = ?2, updated_at = ?2 WHERE video_id = ?1",
-        params![id, now],
+        params![id.clone(), now],
     )
     .map_err(|e| e.to_string())?;
+
+    let _ = crate::oplog::append_delete(&app, "video", &id);
 
     Ok(())
 }
@@ -673,31 +829,22 @@ pub struct Backup {
 
 #[tauri::command]
 pub fn export_db(state: State<DbState>) -> Result<Backup, String> {
-    // Return ALL items including deleted for sync purposes?
-    // Existing export_db was for "backup.json" which was monolithic.
-    // If we replace this with sync engine, we might not need this exact function exposed to frontend anymore,
-    // OR we update it to return everything so sync engine can filter?
-    // But sync engine will probably query DB directly.
-
-    // For now, let's keep this compatible with "Backup" feature if it exists,
-    // but maybe we should only export non-deleted items for a manual "Export Backup" file?
-
     let conn = state.conn.lock().unwrap();
 
-    // Folders
     let mut stmt = conn
-        .prepare("SELECT id, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders WHERE deleted_at IS NULL ORDER BY created_at DESC")
+        .prepare("SELECT id, uid, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders WHERE deleted_at IS NULL ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
     let folder_iter = stmt
         .query_map([], |row| {
             Ok(Folder {
                 id: row.get(0)?,
-                name: row.get(1)?,
-                created_at: row.get(2)?,
-                updated_at: row.get(3)?,
-                deleted_at: row.get(4)?,
-                sort_order: row.get(5)?,
-                parent_id: row.get(6)?,
+                uid: row.get(1)?,
+                name: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                deleted_at: row.get(5)?,
+                sort_order: row.get(6)?,
+                parent_id: row.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -706,7 +853,6 @@ pub fn export_db(state: State<DbState>) -> Result<Backup, String> {
         folders.push(f.map_err(|e| e.to_string())?);
     }
 
-    // Videos
     let mut stmt = conn.prepare("SELECT id, title, thumbnail_url, duration, last_position, created_at, updated_at, deleted_at, folder_id, start_time, end_time, sort_order FROM videos WHERE deleted_at IS NULL ORDER BY created_at DESC").map_err(|e| e.to_string())?;
     let video_iter = stmt
         .query_map([], |row| {
@@ -731,22 +877,22 @@ pub fn export_db(state: State<DbState>) -> Result<Backup, String> {
         videos.push(v.map_err(|e| e.to_string())?);
     }
 
-    // Clips
     let mut stmt = conn
-        .prepare("SELECT id, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips WHERE deleted_at IS NULL")
+        .prepare("SELECT id, uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips WHERE deleted_at IS NULL")
         .map_err(|e| e.to_string())?;
     let clip_iter = stmt
         .query_map([], |row| {
             Ok(Clip {
                 id: row.get(0)?,
-                video_id: row.get(1)?,
-                start_time: row.get(2)?,
-                end_time: row.get(3)?,
-                title: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                deleted_at: row.get(7)?,
-                sort_order: row.get(8)?,
+                uid: row.get(1)?,
+                video_id: row.get(2)?,
+                start_time: row.get(3)?,
+                end_time: row.get(4)?,
+                title: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                deleted_at: row.get(8)?,
+                sort_order: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -765,36 +911,87 @@ pub fn export_db(state: State<DbState>) -> Result<Backup, String> {
 
 #[tauri::command]
 pub fn import_db(state: State<DbState>, backup: Backup) -> Result<(), String> {
-    // This function is for manual import of legacy backups or such.
-    // We should update it to respect new columns, but for now it's less critical than sync engine.
-    // Just ensuring it compiles is enough for this step.
-    // Users might import old backups which lack new fields, so we use defaults.
-
     let mut conn = state.conn.lock().unwrap();
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let now = current_time();
 
-    // ... (Simplified logic for now, or just keep old logic adapted)
+    let mut uid_to_local_id: HashMap<String, i64> = HashMap::new();
 
-    for folder in backup.folders {
-        tx.execute(
-            "INSERT OR IGNORE INTO folders (name, created_at, updated_at, sort_order, parent_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![folder.name, folder.created_at, now, folder.sort_order, folder.parent_id],
-        ).map_err(|e| e.to_string())?;
+    for folder in &backup.folders {
+        let uid = folder.uid.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let existing_local_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM folders WHERE uid = ?1",
+                params![uid],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing_local_id {
+            uid_to_local_id.insert(uid.clone(), id);
+        } else {
+            tx.execute(
+                "INSERT INTO folders (uid, name, created_at, updated_at, deleted_at, sort_order, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![uid, folder.name, folder.created_at, now, folder.deleted_at, folder.sort_order, folder.parent_id],
+            ).map_err(|e| e.to_string())?;
+            let new_id = tx.last_insert_rowid();
+            uid_to_local_id.insert(uid.clone(), new_id);
+        }
+    }
+
+    for folder in &backup.folders {
+        let uid = folder.uid.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Some(new_parent_uid) = backup
+            .folders
+            .iter()
+            .find(|f| f.id == folder.parent_id)
+            .and_then(|f| f.uid.clone())
+        {
+            if let Some(&new_parent_id) = uid_to_local_id.get(&new_parent_uid) {
+                if let Some(&local_id) = uid_to_local_id.get(&uid) {
+                    tx.execute(
+                        "UPDATE folders SET parent_id = ?1 WHERE id = ?2",
+                        params![new_parent_id, local_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+        }
     }
 
     for video in backup.videos {
+        let new_folder_id = video.folder_id.and_then(|orig_id| {
+            backup
+                .folders
+                .iter()
+                .find(|f| f.id == Some(orig_id))
+                .and_then(|f| f.uid.clone())
+                .and_then(|u| uid_to_local_id.get(&u).copied())
+        });
+
         tx.execute(
-             "INSERT OR IGNORE INTO videos (id, title, thumbnail_url, duration, last_position, created_at, updated_at, folder_id, start_time, end_time, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-             params![video.id, video.title, video.thumbnail_url, video.duration, video.last_position, video.created_at, now, video.folder_id, video.start_time, video.end_time, video.sort_order],
+            "INSERT INTO videos (id, title, thumbnail_url, duration, last_position, created_at, updated_at, folder_id, start_time, end_time, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET title = excluded.title, thumbnail_url = excluded.thumbnail_url, folder_id = excluded.folder_id, start_time = excluded.start_time, end_time = excluded.end_time, sort_order = excluded.sort_order, updated_at = excluded.updated_at",
+             params![video.id, video.title, video.thumbnail_url, video.duration, video.last_position, video.created_at, now, new_folder_id, video.start_time, video.end_time, video.sort_order],
         ).map_err(|e| e.to_string())?;
     }
 
     for clip in backup.clips {
-        tx.execute(
-            "INSERT OR IGNORE INTO clips (video_id, start_time, end_time, title, created_at, updated_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
-            params![clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, clip.sort_order],
-        ).map_err(|e| e.to_string())?;
+        let uid = clip.uid.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let existing_local_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM clips WHERE uid = ?1",
+                params![uid],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if existing_local_id.is_none() {
+            tx.execute(
+                "INSERT INTO clips (uid, video_id, start_time, end_time, title, created_at, updated_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+                params![uid, clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, clip.sort_order],
+            ).map_err(|e| e.to_string())?;
+        }
     }
 
     tx.commit().map_err(|e| e.to_string())?;
@@ -813,12 +1010,6 @@ pub fn update_clip(state: State<DbState>, clip: Clip) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-#[allow(dead_code)]
-pub fn mark_changes_synced(_state: State<DbState>) -> Result<(), String> {
-    Ok(())
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SortItem {
     pub id: i64,
@@ -829,6 +1020,121 @@ pub struct SortItem {
 pub struct VideoSortItem {
     pub id: String,
     pub sort_order: i32,
+}
+
+#[tauri::command]
+pub fn restore_video(state: State<DbState>, app: AppHandle, id: String) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    let now = current_time();
+    conn.execute(
+        "UPDATE videos SET deleted_at = NULL, updated_at = ?2 WHERE id = ?1",
+        params![id.clone(), now],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let snapshot: Option<crate::db::Video> = conn
+        .query_row(
+            "SELECT id, title, thumbnail_url, duration, last_position, created_at, updated_at, deleted_at, folder_id, start_time, end_time, sort_order FROM videos WHERE id = ?1",
+            params![id.clone()],
+            |row| Ok(crate::db::Video {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                thumbnail_url: row.get(2)?,
+                duration: row.get(3)?,
+                last_position: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                deleted_at: row.get(7)?,
+                folder_id: row.get(8)?,
+                start_time: row.get(9)?,
+                end_time: row.get(10)?,
+                sort_order: row.get(11)?,
+            }),
+        )
+        .ok();
+    drop(conn);
+
+    if let Some(v) = snapshot {
+        let fields = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
+        let _ = crate::oplog::append_upsert(&app, "video", &id, fields);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn restore_folder(state: State<DbState>, app: AppHandle, id: i64) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    let now = current_time();
+    conn.execute(
+        "UPDATE folders SET deleted_at = NULL, updated_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let snapshot: Option<crate::db::Folder> = conn
+        .query_row(
+            "SELECT id, uid, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders WHERE id = ?1",
+            params![id],
+            |row| Ok(crate::db::Folder {
+                id: row.get(0)?,
+                uid: row.get(1)?,
+                name: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                deleted_at: row.get(5)?,
+                sort_order: row.get(6)?,
+                parent_id: row.get(7)?,
+            }),
+        )
+        .ok();
+    drop(conn);
+
+    if let Some(folder) = snapshot {
+        if let Some(uid) = folder.uid.clone() {
+            let fields = serde_json::to_value(&folder).unwrap_or(serde_json::Value::Null);
+            let _ = crate::oplog::append_upsert(&app, "folder", &uid, fields);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn restore_clip(state: State<DbState>, app: AppHandle, id: i32) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    let now = current_time();
+    conn.execute(
+        "UPDATE clips SET deleted_at = NULL, updated_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let snapshot: Option<crate::db::Clip> = conn
+        .query_row(
+            "SELECT id, uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips WHERE id = ?1",
+            params![id],
+            |row| Ok(crate::db::Clip {
+                id: row.get(0)?,
+                uid: row.get(1)?,
+                video_id: row.get(2)?,
+                start_time: row.get(3)?,
+                end_time: row.get(4)?,
+                title: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                deleted_at: row.get(8)?,
+                sort_order: row.get(9)?,
+            }),
+        )
+        .ok();
+    drop(conn);
+
+    if let Some(clip) = snapshot {
+        if let Some(uid) = clip.uid.clone() {
+            let fields = serde_json::to_value(&clip).unwrap_or(serde_json::Value::Null);
+            let _ = crate::oplog::append_upsert(&app, "clip", &uid, fields);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -879,17 +1185,18 @@ pub fn update_clip_sort_order(state: State<DbState>, clips: Vec<SortItem>) -> Re
 
 pub fn get_all_folders_internal(conn: &Connection) -> Result<Vec<Folder>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders",
+        "SELECT id, uid, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders",
     )?;
     let folder_iter = stmt.query_map([], |row| {
         Ok(Folder {
             id: row.get(0)?,
-            name: row.get(1)?,
-            created_at: row.get(2)?,
-            updated_at: row.get(3)?,
-            deleted_at: row.get(4)?,
-            sort_order: row.get(5)?,
-            parent_id: row.get(6)?,
+            uid: row.get(1)?,
+            name: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+            deleted_at: row.get(5)?,
+            sort_order: row.get(6)?,
+            parent_id: row.get(7)?,
         })
     })?;
     let mut folders = Vec::new();
@@ -925,18 +1232,19 @@ pub fn get_all_videos_internal(conn: &Connection) -> Result<Vec<Video>, rusqlite
 }
 
 pub fn get_all_clips_internal(conn: &Connection) -> Result<Vec<Clip>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT id, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips")?;
+    let mut stmt = conn.prepare("SELECT id, uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips")?;
     let clip_iter = stmt.query_map([], |row| {
         Ok(Clip {
             id: row.get(0)?,
-            video_id: row.get(1)?,
-            start_time: row.get(2)?,
-            end_time: row.get(3)?,
-            title: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
-            deleted_at: row.get(7)?,
-            sort_order: row.get(8)?,
+            uid: row.get(1)?,
+            video_id: row.get(2)?,
+            start_time: row.get(3)?,
+            end_time: row.get(4)?,
+            title: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            deleted_at: row.get(8)?,
+            sort_order: row.get(9)?,
         })
     })?;
     let mut clips = Vec::new();
@@ -946,14 +1254,17 @@ pub fn get_all_clips_internal(conn: &Connection) -> Result<Vec<Clip>, rusqlite::
     Ok(clips)
 }
 
+#[allow(dead_code)]
 pub fn upsert_folder_internal(conn: &Connection, folder: &Folder) -> Result<(), rusqlite::Error> {
+    let uid = folder.uid.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     conn.execute(
-        "INSERT OR REPLACE INTO folders (id, name, created_at, updated_at, deleted_at, sort_order, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![folder.id, folder.name, folder.created_at, folder.updated_at, folder.deleted_at, folder.sort_order, folder.parent_id],
+        "INSERT INTO folders (id, uid, name, created_at, updated_at, deleted_at, sort_order, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO UPDATE SET uid = excluded.uid, name = excluded.name, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at, sort_order = excluded.sort_order, parent_id = excluded.parent_id",
+        params![folder.id, uid, folder.name, folder.created_at, folder.updated_at, folder.deleted_at, folder.sort_order, folder.parent_id],
     )?;
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn upsert_video_internal(conn: &Connection, video: &Video) -> Result<(), rusqlite::Error> {
     let folder_id = if video.folder_id == Some(0) {
         None
@@ -967,24 +1278,76 @@ pub fn upsert_video_internal(conn: &Connection, video: &Video) -> Result<(), rus
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn upsert_clip_internal(conn: &Connection, clip: &Clip) -> Result<(), rusqlite::Error> {
+    let uid = clip.uid.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if let Some(id) = clip.id {
         conn.execute(
-            "INSERT OR REPLACE INTO clips (id, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-             params![id, clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, clip.updated_at, clip.deleted_at, clip.sort_order],
+            "INSERT INTO clips (id, uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO UPDATE SET uid = excluded.uid, video_id = excluded.video_id, start_time = excluded.start_time, end_time = excluded.end_time, title = excluded.title, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at, sort_order = excluded.sort_order",
+             params![id, uid, clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, clip.updated_at, clip.deleted_at, clip.sort_order],
         )?;
     } else {
         conn.execute(
-            "INSERT INTO clips (video_id, start_time, end_time, title, created_at, updated_at, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-             params![clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, clip.updated_at, clip.deleted_at],
+            "INSERT INTO clips (uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+             params![uid, clip.video_id, clip.start_time, clip.end_time, clip.title, clip.created_at, clip.updated_at, clip.deleted_at, clip.sort_order],
         )?;
     }
     Ok(())
 }
 
-fn extract_video_id(url: &str) -> Option<String> {
-    if url.len() == 11 {
-        return Some(url.to_string());
+fn extract_video_id(input: &str) -> Option<String> {
+    let id_chars = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+
+    for line in input.lines() {
+        let line = line.trim();
+        if line.len() == 11 && line.chars().all(id_chars) {
+            return Some(line.to_string());
+        }
+
+        if let Some((scheme_end, _)) = line.find("://").map(|i| (i + 3, ())) {
+            let after_scheme = &line[scheme_end.min(line.len())..];
+            let host_end = after_scheme.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(after_scheme.len());
+            let host = &after_scheme[..host_end].to_lowercase();
+            let host = host.strip_prefix("www.").unwrap_or(host);
+            let host = host.strip_prefix("m.").unwrap_or(host);
+
+            let path_and_query = &after_scheme[host_end.min(after_scheme.len())..];
+            let (path, query) = match path_and_query.find('?') {
+                Some(qi) => (&path_and_query[..qi], &path_and_query[qi + 1..]),
+                None => (path_and_query, ""),
+            };
+
+            if host == "youtu.be" {
+                let id = path.trim_start_matches('/').split('/').next().unwrap_or("");
+                if id.len() == 11 && id.chars().all(id_chars) {
+                    return Some(id.to_string());
+                }
+            }
+
+            if host.ends_with("youtube.com") || host.ends_with("youtube-nocookie.com") {
+                for pair in query.split('&') {
+                    if let Some(eq) = pair.find('=') {
+                        let key = &pair[..eq];
+                        let value = &pair[eq + 1..];
+                        if key == "v" && value.len() == 11 && value.chars().all(id_chars) {
+                            return Some(value.to_string());
+                        }
+                    }
+                }
+
+                let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                let keyword_idx = parts.iter().position(|p| {
+                    matches!(*p, "embed" | "v" | "shorts" | "live" | "watch")
+                });
+                if let Some(idx) = keyword_idx {
+                    if let Some(id) = parts.get(idx + 1) {
+                        if id.len() == 11 && id.chars().all(id_chars) {
+                            return Some((*id).to_string());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let patterns = [
@@ -993,18 +1356,20 @@ fn extract_video_id(url: &str) -> Option<String> {
         "youtube.com/embed/",
         "youtube.com/v/",
         "youtube.com/shorts/",
+        "youtube.com/live/",
     ];
 
     for pattern in patterns {
-        if let Some(pos) = url.find(pattern) {
+        if let Some(pos) = input.find(pattern) {
             let start = pos + pattern.len();
-            let end = start + 11.min(url.len() - start);
-            let id = &url[start..end];
-            if id.len() == 11 {
+            let end = start + 11.min(input.len().saturating_sub(start));
+            let id = &input[start..end];
+            if id.len() == 11 && id.chars().all(id_chars) {
                 return Some(id.to_string());
             }
         }
     }
+
     None
 }
 
@@ -1057,10 +1422,9 @@ pub struct VideoOembed {
     pub thumbnail_url: String,
 }
 
-#[tauri::command]
-pub async fn fetch_video_oembed(video_id: String) -> Result<Option<VideoOembed>, String> {
+pub async fn fetch_video_oembed_inner(video_id: &str) -> Result<Option<VideoOembed>, String> {
     let url = format!(
-        "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={}&format=json",
+        "https://www.youtube.com/oembed?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D{}&format=json",
         video_id
     );
     let client = reqwest::Client::builder()
@@ -1074,9 +1438,18 @@ pub async fn fetch_video_oembed(video_id: String) -> Result<Option<VideoOembed>,
     }
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     Ok(Some(VideoOembed {
-        video_id,
+        video_id: video_id.to_string(),
         title: json["title"].as_str().unwrap_or("Untitled").to_string(),
         author: json["author_name"].as_str().unwrap_or("").to_string(),
         thumbnail_url: json["thumbnail_url"].as_str().unwrap_or("").to_string(),
     }))
+}
+
+pub fn extract_video_id_for_pub(input: &str) -> Option<String> {
+    extract_video_id(input)
+}
+
+#[tauri::command]
+pub async fn fetch_video_oembed(video_id: String) -> Result<Option<VideoOembed>, String> {
+    fetch_video_oembed_inner(&video_id).await
 }

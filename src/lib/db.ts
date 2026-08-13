@@ -7,14 +7,6 @@ export function formatTime(totalSeconds: number): string {
     return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
 
-let changeListener: (() => void) | null = null;
-
-function notifyChange(): void {
-    if (changeListener) {
-        changeListener();
-    }
-}
-
 export interface Video {
     id: string;
     title: string;
@@ -30,6 +22,7 @@ export interface Video {
 
 export interface Clip {
     id?: number;
+    uid?: string;
     video_id: string;
     start_time: number;
     end_time: number;
@@ -40,6 +33,7 @@ export interface Clip {
 
 export interface Folder {
     id?: number;
+    uid?: string;
     name: string;
     created_at: number;
     parent_id: number | null;
@@ -52,7 +46,6 @@ export async function getVideos(): Promise<Video[]> {
 
 export async function saveVideo(video: Video): Promise<void> {
     await invoke("save_video", { video });
-    notifyChange();
 }
 
 export async function getClips(videoId: string): Promise<Clip[]> {
@@ -61,17 +54,14 @@ export async function getClips(videoId: string): Promise<Clip[]> {
 
 export async function saveClip(clip: Clip): Promise<void> {
     await invoke("save_clip", { clip });
-    notifyChange();
 }
 
 export async function deleteClip(id: number): Promise<void> {
     await invoke("delete_clip", { id });
-    notifyChange();
 }
 
 export async function deleteVideo(id: string): Promise<void> {
     await invoke("delete_video", { id });
-    notifyChange();
 }
 
 export async function getFolders(): Promise<Folder[]> {
@@ -80,43 +70,35 @@ export async function getFolders(): Promise<Folder[]> {
 
 export async function saveFolder(folder: Folder): Promise<number> {
     const result = await invoke<number>("save_folder", { folder });
-    notifyChange();
     return result;
 }
 
 export async function deleteFolder(id: number): Promise<void> {
     await invoke("delete_folder", { id });
-    notifyChange();
 }
 
 export async function renameFolder(id: number, name: string): Promise<void> {
     await invoke("rename_folder", { id, name });
-    notifyChange();
 }
 
 export async function renameVideo(id: string, title: string): Promise<void> {
     await invoke("rename_video", { id, title });
-    notifyChange();
 }
 
 export async function renameClip(id: number, title: string): Promise<void> {
     await invoke("rename_clip", { id, title });
-    notifyChange();
 }
 
 export async function updateClip(clip: Clip): Promise<void> {
     await invoke("update_clip", { clip });
-    notifyChange();
 }
 
 export async function updateVideoFolder(videoId: string, folderId: number | null): Promise<void> {
     await invoke("update_video_folder", { videoId, folderId });
-    notifyChange();
 }
 
 export async function updateFolderParent(folderId: number, parentId: number | null): Promise<void> {
     await invoke("update_folder_parent", { folderId, parentId });
-    notifyChange();
 }
 
 export interface Backup {
@@ -150,77 +132,24 @@ export async function updateSortOrder(
     videos: { id: string; sort_order: number }[],
 ): Promise<void> {
     await invoke("update_sort_order", { folders, videos });
-    notifyChange();
 }
 
 export async function updateClipSortOrder(
     clips: { id: number; sort_order: number }[],
 ): Promise<void> {
     await invoke("update_clip_sort_order", { clips });
-    notifyChange();
 }
 
-export async function setChangeListener(listener: () => void): Promise<void> {
-    changeListener = listener;
+export async function restoreVideo(id: string): Promise<void> {
+    await invoke("restore_video", { id });
 }
 
-export interface SyncMetadata {
-    last_sync_timestamp: number;
-    last_sync_device: string;
+export async function restoreFolder(id: number): Promise<void> {
+    await invoke("restore_folder", { id });
 }
 
-export interface Change {
-    id?: number;
-    entity_type: string;
-    entity_id: string;
-    change_type: 'Create' | 'Update' | 'Delete';
-    data?: string;
-    timestamp: number;
-    device_id: string;
-    synced: boolean;
-}
-
-export interface ChangeSet {
-    changes: Change[];
-    metadata: SyncMetadata;
-    device_id: string;
-}
-
-export async function getDeviceId(): Promise<string> {
-    return await invoke("get_device_id");
-}
-
-export async function getSyncStatus(): Promise<SyncMetadata> {
-    return await invoke("get_sync_status");
-}
-
-export async function getPendingChangesCount(): Promise<number> {
-    return await invoke("get_pending_changes_count");
-}
-
-export async function exportChanges(since: number): Promise<ChangeSet> {
-    return await invoke("export_changes", { since });
-}
-
-export async function importChanges(changeset: ChangeSet): Promise<void> {
-    await invoke("import_changes", { changeset });
-}
-
-export async function markChangesSynced(): Promise<void> {
-    await invoke("mark_changes_synced");
-}
-
-export async function recordChange(
-    entityType: string,
-    entityId: string,
-    changeType: string,
-    data?: string
-): Promise<void> {
-    await invoke("record_change", { entityType, entityId, changeType, data });
-}
-
-export async function resetSync(): Promise<void> {
-    await invoke("reset_sync");
+export async function restoreClip(id: number): Promise<void> {
+    await invoke("restore_clip", { id });
 }
 
 export interface VideoOembed {
@@ -232,4 +161,32 @@ export interface VideoOembed {
 
 export async function fetchVideoOembed(videoId: string): Promise<VideoOembed | null> {
     return await invoke("fetch_video_oembed", { videoId });
+}
+
+export interface GithubConfigPublic {
+    github_repo: string;
+    token_present: boolean;
+}
+
+export async function getGithubConfig(): Promise<GithubConfigPublic> {
+    return await invoke("get_github_config");
+}
+
+export async function setGithubConfig(
+    githubRepo: string,
+    githubToken: string | null,
+): Promise<void> {
+    await invoke("set_github_config", { githubRepo, githubToken });
+}
+
+export async function clearGithubToken(): Promise<void> {
+    await invoke("clear_github_token");
+}
+
+export async function pullRemote(): Promise<number> {
+    return await invoke<number>("pull_remote");
+}
+
+export async function compactLibrary(): Promise<void> {
+    await invoke("compact_library");
 }

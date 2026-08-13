@@ -22,18 +22,14 @@
     }
 </script>
 
-<!-- Trigger Area (Invisible strip at the top) -->
 <div
     class="peer fixed top-0 left-0 right-0 h-3 z-[60] hover:bg-transparent"
 ></div>
 
-<!-- Title Bar -->
 {#if !isAndroid}
 <div
     class="peer fixed top-0 left-0 right-0 h-10 bg-black border-b border-zinc-900 border-opacity-50 flex items-center px-4 z-[100] transition-transform duration-300 ease-out shadow-lg group"
 >
-    <!-- Drag Region (Background Layer) -->
-    <!-- Explicitly calls startDrag on mousedown -->
     <div
         role="button"
         tabindex="-1"
@@ -42,19 +38,15 @@
         aria-hidden="true"
     ></div>
 
-    <!-- Content Layer (Foreground) -->
-    <!-- Sits above drag region -->
     <div
         class="relative z-10 flex items-center w-full pointer-events-none justify-between"
     >
-        <!-- Title -->
         <div class="flex items-center gap-2">
             <span class="text-sm font-medium text-white/90 shadow-sm"
                 >yClippy</span
             >
         </div>
 
-        <!-- Controls -->
         <div class="flex items-center gap-1 pointer-events-auto">
             <button
                 onclick={minimize}

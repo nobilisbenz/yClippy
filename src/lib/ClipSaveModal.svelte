@@ -1,7 +1,6 @@
 <script lang="ts">
     import { saveClip, type Video, type Clip } from "./db";
     import { appState } from "./state.svelte";
-    import { getCurrentWebview } from "@tauri-apps/api/webview";
     import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
     let { video, startTime, endTime, onClose, onSaved } = $props<{
@@ -38,9 +37,10 @@
             await saveClip(clip);
             await appState.refreshActiveClips();
             onSaved();
+            appState.showToast("Clip saved", "success");
         } catch (e) {
             console.error(e);
-            alert("Failed to save clip: " + e);
+            appState.showToast(`Failed to save clip: ${String(e)}`, "error");
         } finally {
             saving = false;
         }
@@ -48,26 +48,40 @@
 
     async function handleClipboard() {
         try {
-            let template = appState.settings.clipboardTemplate || "";
-            const code = template
-                .replace(/\\n/g, "\n")
-                .replace(/\/n/g, "\n")
-                .replace(/{id}/gi, video.id)
-                .replace(/{start}/gi, Math.floor(startTime).toString())
-                .replace(/{end}/gi, Math.floor(endTime).toString())
-                .replace(/{title}/gi, title || `Clip from ${video.title}`)
-                .replace(
-                    /{url}/gi,
-                    `https://www.youtube.com/watch?v=${video.id}&t=${Math.floor(startTime)}s`,
-                );
-
+            const code = renderTemplate();
             await writeText(code);
             onSaved();
-            alert("Copied custom template to clipboard!");
+            appState.showToast("Copied to clipboard", "success");
         } catch (e) {
             console.error(e);
-            alert("Clipboard Error: " + e);
+            appState.showToast(`Clipboard error: ${String(e)}`, "error");
         }
+    }
+
+    function renderTemplate(): string {
+        const template = appState.settings.clipboardTemplate || "";
+        const startSec = Math.floor(startTime);
+        const endSec = Math.floor(endTime);
+        const url = `https://www.youtube.com/watch?v=${video.id}&t=${startSec}s`;
+        const clipTitle = title || `Clip from ${video.title}`;
+        return template
+            .replace(/\\n/g, "\n")
+            .replace(/{id}/gi, video.id)
+            .replace(/{start}/gi, startSec.toString())
+            .replace(/{start_hms}/gi, formatHMS(startSec))
+            .replace(/{end}/gi, endSec.toString())
+            .replace(/{end_hms}/gi, formatHMS(endSec))
+            .replace(/{title}/gi, clipTitle)
+            .replace(/{url}/gi, url);
+    }
+
+    function formatHMS(totalSeconds: number): string {
+        const h = Math.floor(totalSeconds / 3600);
+        const m = Math.floor((totalSeconds % 3600) / 60);
+        const s = Math.floor(totalSeconds % 60);
+        return `${h.toString().padStart(2, "0")}:${m
+            .toString()
+            .padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
     }
 </script>
 

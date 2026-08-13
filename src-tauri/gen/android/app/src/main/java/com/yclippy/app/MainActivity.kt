@@ -18,13 +18,31 @@ class MainActivity : TauriActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        handleShareIntent(intent)
+        handleIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleShareIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        when (intent?.action) {
+            Intent.ACTION_SEND -> handleShareIntent(intent)
+            Intent.ACTION_VIEW -> handleViewIntent(intent)
+        }
+    }
+
+    private fun handleViewIntent(intent: Intent) {
+        val data = intent.data ?: return
+        if (data.scheme == "yclippy") {
+            val videoId = data.getQueryParameter("v") ?: return
+            deliverSharedVideo(videoId)
+            return
+        }
+        val videoId = extractYouTubeId(data.toString()) ?: return
+        deliverSharedVideo(videoId)
     }
 
     override fun onWebViewCreate(webView: WebView) {
@@ -70,8 +88,12 @@ class MainActivity : TauriActivity() {
         return null
     }
 
-    fun openInExternalPlayer(videoId: String) {
-        val watchUrl = "https://www.youtube.com/watch?v=$videoId"
+    fun openInExternalPlayer(videoId: String, startSeconds: Int = 0) {
+        val watchUrl = if (startSeconds > 0) {
+            "https://www.youtube.com/watch?v=$videoId&t=${startSeconds}s"
+        } else {
+            "https://www.youtube.com/watch?v=$videoId"
+        }
         val candidates = listOf(
             "app.rvx.android.youtube"       to "ReVanced Extended",
             "app.revanced.android.youtube"  to "ReVanced",
@@ -85,7 +107,7 @@ class MainActivity : TauriActivity() {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             try {
-                Log.d(TAG, "Trying to open in $pkg ($label)")
+                Log.d(TAG, "Trying to open in $pkg ($label) at $startSeconds s")
                 startActivity(intent)
                 Log.d(TAG, "Successfully opened in $pkg")
                 Toast.makeText(
@@ -131,9 +153,9 @@ class MainActivity : TauriActivity() {
 
 class YClippyNative(private val activity: MainActivity) {
     @JavascriptInterface
-    fun openInRevanced(videoId: String) {
+    fun openInRevanced(videoId: String, startSeconds: Int = 0) {
         activity.runOnUiThread {
-            activity.openInExternalPlayer(videoId)
+            activity.openInExternalPlayer(videoId, startSeconds)
         }
     }
 

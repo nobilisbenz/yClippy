@@ -1,29 +1,12 @@
-use crate::db::{self, Clip, DbState, Folder, Video};
+use crate::db::{self, DbState};
 use crate::github_api;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use tauri::{AppHandle, Manager, State};
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-struct Metadata {
-    last_sync_timestamp: i64,
-    device_id: String,
-}
-
-#[derive(Serialize)]
-#[allow(dead_code)]
-struct SyncFiles {
-    videos: Vec<Video>,
-    folders: Vec<Folder>,
-    clips: Vec<Clip>,
-    metadata: Metadata,
-}
+use crate::oplog;
+use tauri::{AppHandle, Manager};
 
 pub struct SyncEngine {
-    token: String,
-    owner: String,
-    repo: String,
+    pub token: String,
+    pub owner: String,
+    pub repo: String,
 }
 
 impl SyncEngine {
@@ -33,111 +16,112 @@ impl SyncEngine {
     }
 
     pub async fn sync(&self, app: AppHandle) -> Result<String, String> {
-        // 1. Fetch Remote Data (No DB lock needed)
-        let remote_videos_res =
-            github_api::get_file_content(&self.token, &self.owner, &self.repo, "videos.json").await;
-        let remote_folders_res =
-            github_api::get_file_content(&self.token, &self.owner, &self.repo, "folders.json")
-                .await;
-        let remote_clips_res =
-            github_api::get_file_content(&self.token, &self.owner, &self.repo, "clips.json").await;
+        self.push(&app).await?;
+        self.pull(&app).await?;
+        crate::oplog::compact_library(app.clone())?;
+        Ok("Sync completed".to_string())
+    }
 
-        let (remote_videos, v_sha): (Vec<Video>, Option<String>) = match remote_videos_res {
-            Ok(Some((content, sha))) => (
-                serde_json::from_str(&content).unwrap_or_default(),
-                Some(sha),
-            ),
-            _ => (Vec::new(), None),
-        };
-
-        let (remote_folders, f_sha): (Vec<Folder>, Option<String>) = match remote_folders_res {
-            Ok(Some((content, sha))) => (
-                serde_json::from_str(&content).unwrap_or_default(),
-                Some(sha),
-            ),
-            _ => (Vec::new(), None),
-        };
-
-        let (remote_clips, c_sha): (Vec<Clip>, Option<String>) = match remote_clips_res {
-            Ok(Some((content, sha))) => (
-                serde_json::from_str(&content).unwrap_or_default(),
-                Some(sha),
-            ),
-            _ => (Vec::new(), None),
-        };
-
-        // 2. Fetch Local Data (Lock DB)
-        let state: State<DbState> = app.state();
+    pub async fn push(&self, app: &AppHandle) -> Result<(), String> {
+        let mut watermarks = oplog::read_watermarks(app);
 
         let (local_videos, local_folders, local_clips) = {
+            let state: tauri::State<DbState> = app.state();
             let conn = state.conn.lock().unwrap();
-            let videos = db::get_all_videos_internal(&conn).map_err(|e| e.to_string())?;
-            let folders = db::get_all_folders_internal(&conn).map_err(|e| e.to_string())?;
-            let clips = db::get_all_clips_internal(&conn).map_err(|e| e.to_string())?;
-            (videos, folders, clips)
-        }; // Lock dropped here!
+            let v = db::get_all_videos_internal(&conn).map_err(|e| e.to_string())?;
+            let f = db::get_all_folders_internal(&conn).map_err(|e| e.to_string())?;
+            let c = db::get_all_clips_internal(&conn).map_err(|e| e.to_string())?;
+            (v, f, c)
+        };
 
-        // 3. Merge Strategies (No lock)
-        let merged_videos = merge_entities(local_videos, remote_videos);
-        let merged_folders = merge_entities(local_folders, remote_folders);
-        let merged_clips = merge_entities_clips(local_clips, remote_clips);
+        let payload = oplog::LibraryPayload {
+            folders: local_folders,
+            videos: local_videos,
+            clips: local_clips,
+            updated_at: oplog::current_time(),
+        };
 
-        // 4. Update Local DB (Lock DB)
-        {
-            let conn = state.conn.lock().unwrap();
-            for v in &merged_videos {
-                db::upsert_video_internal(&conn, v).map_err(|e| e.to_string())?;
-            }
-            for f in &merged_folders {
-                db::upsert_folder_internal(&conn, f).map_err(|e| e.to_string())?;
-            }
-            for c in &merged_clips {
-                db::upsert_clip_internal(&conn, c).map_err(|e| e.to_string())?;
-            }
-        } // Lock dropped
-
-        // 5. Push (Upload Merged Data) (No lock)
-        let videos_json =
-            serde_json::to_string_pretty(&merged_videos).map_err(|e| e.to_string())?;
-        let folders_json =
-            serde_json::to_string_pretty(&merged_folders).map_err(|e| e.to_string())?;
-        let clips_json = serde_json::to_string_pretty(&merged_clips).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+        let existing = github_api::get_file_content(&self.token, &self.owner, &self.repo, "library.json").await;
+        let sha = match existing {
+            Ok(Some((_, sha))) => Some(sha),
+            _ => None,
+        };
 
         github_api::update_file(
             &self.token,
             &self.owner,
             &self.repo,
-            "videos.json",
-            &videos_json,
-            v_sha,
-            "Sync videos",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        github_api::update_file(
-            &self.token,
-            &self.owner,
-            &self.repo,
-            "folders.json",
-            &folders_json,
-            f_sha,
-            "Sync folders",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        github_api::update_file(
-            &self.token,
-            &self.owner,
-            &self.repo,
-            "clips.json",
-            &clips_json,
-            c_sha,
-            "Sync clips",
+            "library.json",
+            &json,
+            sha,
+            "Sync yClippy library",
         )
         .await
         .map_err(|e| e.to_string())?;
 
-        Ok("Sync completed".to_string())
+        watermarks.compacted_through.insert("library".to_string(), oplog::current_time());
+        oplog::write_watermarks(app, &watermarks)?;
+
+        Ok(())
+    }
+
+    pub async fn pull(&self, app: &AppHandle) -> Result<u64, String> {
+        let content = github_api::get_file_content(&self.token, &self.owner, &self.repo, "library.json").await;
+        let (json, _sha) = match content {
+            Ok(Some((c, s))) => (c, s),
+            _ => return Ok(0),
+        };
+
+        let payload: oplog::LibraryPayload = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+
+        let state: tauri::State<DbState> = app.state();
+        let mut conn = state.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        let mut applied = 0u64;
+        let now = oplog::current_time();
+
+        for f in &payload.folders {
+            if f.uid.is_none() {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO folders (uid, name, created_at, updated_at, deleted_at, sort_order, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(uid) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at, sort_order = excluded.sort_order, parent_id = excluded.parent_id",
+                rusqlite::params![f.uid, f.name, f.created_at, now, f.deleted_at, f.sort_order, f.parent_id],
+            ).map_err(|e| e.to_string())?;
+            applied += 1;
+        }
+
+        for v in &payload.videos {
+            let folder_id = if v.folder_id == Some(0) { None } else { v.folder_id };
+            tx.execute(
+                "INSERT INTO videos (id, title, thumbnail_url, duration, last_position, created_at, updated_at, deleted_at, folder_id, start_time, end_time, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO UPDATE SET title = excluded.title, thumbnail_url = excluded.thumbnail_url, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at, folder_id = excluded.folder_id, start_time = excluded.start_time, end_time = excluded.end_time, sort_order = excluded.sort_order",
+                rusqlite::params![v.id, v.title, v.thumbnail_url, v.duration, v.last_position, v.created_at, now, v.deleted_at, folder_id, v.start_time, v.end_time, v.sort_order],
+            ).map_err(|e| e.to_string())?;
+            applied += 1;
+        }
+
+        for c in &payload.clips {
+            if c.uid.is_none() {
+                continue;
+            }
+            if let Some(id) = c.id {
+                tx.execute(
+                    "INSERT INTO clips (id, uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO UPDATE SET uid = excluded.uid, video_id = excluded.video_id, start_time = excluded.start_time, end_time = excluded.end_time, title = excluded.title, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at, sort_order = excluded.sort_order",
+                    rusqlite::params![id, c.uid, c.video_id, c.start_time, c.end_time, c.title, c.created_at, now, c.deleted_at, c.sort_order],
+                ).map_err(|e| e.to_string())?;
+            } else {
+                tx.execute(
+                    "INSERT INTO clips (uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+                    rusqlite::params![c.uid, c.video_id, c.start_time, c.end_time, c.title, c.created_at, c.deleted_at, c.sort_order],
+                ).map_err(|e| e.to_string())?;
+            }
+            applied += 1;
+        }
+
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(applied)
     }
 }
 
@@ -152,61 +136,4 @@ fn parse_repo_url(url: &str) -> Option<(String, String)> {
         }
     }
     None
-}
-
-trait Syncable {
-    fn get_id(&self) -> String;
-    fn get_updated_at(&self) -> i64;
-}
-
-impl Syncable for Video {
-    fn get_id(&self) -> String {
-        self.id.clone()
-    }
-    fn get_updated_at(&self) -> i64 {
-        self.updated_at
-    }
-}
-
-impl Syncable for Folder {
-    fn get_id(&self) -> String {
-        self.id.map(|i| i.to_string()).unwrap_or_default()
-    }
-    fn get_updated_at(&self) -> i64 {
-        self.updated_at
-    }
-}
-
-impl Syncable for Clip {
-    fn get_id(&self) -> String {
-        self.id.map(|i| i.to_string()).unwrap_or_default()
-    }
-    fn get_updated_at(&self) -> i64 {
-        self.updated_at
-    }
-}
-
-fn merge_entities<T: Syncable + Clone + std::fmt::Debug>(local: Vec<T>, remote: Vec<T>) -> Vec<T> {
-    let mut map: HashMap<String, T> = HashMap::new();
-
-    for item in local {
-        map.insert(item.get_id(), item);
-    }
-
-    for item in remote {
-        let id = item.get_id();
-        if let Some(local_item) = map.get(&id) {
-            if item.get_updated_at() > local_item.get_updated_at() {
-                map.insert(id, item);
-            }
-        } else {
-            map.insert(id, item);
-        }
-    }
-
-    map.into_values().collect()
-}
-
-fn merge_entities_clips(local: Vec<Clip>, remote: Vec<Clip>) -> Vec<Clip> {
-    merge_entities(local, remote)
 }

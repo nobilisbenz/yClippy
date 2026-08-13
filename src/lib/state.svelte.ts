@@ -5,9 +5,10 @@ class AppState {
     folders = $state<Folder[]>([]);
     activeVideo = $state<Video | null>(null);
     activeClips = $state<Clip[]>([]);
+    videosLoadingPromise: Promise<void> | null = null;
+    seekToTime = $state<number | undefined>(undefined);
 
     // UI State
-    isSidebarOpen = $state(false);
     isClipsSidebarOpen = $state(false);
     isClipModalOpen = $state(false);
     isAddVideoModalOpen = $state(false);
@@ -20,7 +21,7 @@ class AppState {
 
     settings = $state({
         clipboardTemplate: `<iframe src="https://www.youtube.com/embed/{id}?start={start}&end={end}" height="360" width="100%" seamless="seamless" frameborder="0" allowfullscreen></iframe>`,
-        githubToken: "",
+        githubTokenPresent: false,
         githubRepo: "",
         lastSyncAt: null as number | null,
     });
@@ -40,11 +41,53 @@ class AppState {
     syncStatus = $state<"idle" | "syncing" | "success" | "error">("idle");
     syncError = $state<string | null>(null);
 
+    toast = $state<{ id: number; message: string; kind: "info" | "success" | "error" } | null>(null);
+
+    showToast(message: string, kind: "info" | "success" | "error" = "info") {
+        this.toast = { id: Date.now(), message, kind };
+    }
+
+    undoable = $state<{
+        id: number;
+        message: string;
+        restore: () => Promise<void>;
+        expiresAt: number;
+    } | null>(null);
+
+    showUndo(message: string, restore: () => Promise<void>, durationMs = 5000) {
+        this.undoable = {
+            id: Date.now(),
+            message,
+            restore,
+            expiresAt: Date.now() + durationMs,
+        };
+    }
+
+    async performUndo() {
+        const u = this.undoable;
+        if (!u) return;
+        this.undoable = null;
+        try {
+            await u.restore();
+            this.showToast("Restored", "success");
+        } catch (e) {
+            console.error("Undo failed:", e);
+            this.showToast(`Undo failed: ${String(e)}`, "error");
+        }
+    }
+
+    dismissUndo() {
+        this.undoable = null;
+    }
+
     constructor() {
         console.log("[AppState] Initializing...");
         this.refreshVideos().catch(e => console.error("[AppState] Failed to refresh videos:", e));
         this.refreshFolders().catch(e => console.error("[AppState] Failed to refresh folders:", e));
         this.loadSettings();
+        this.refreshGithubConfig().catch((e) =>
+            console.error("[AppState] Failed to refresh GitHub config:", e),
+        );
 
         console.log("[AppState] Initialization complete");
     }
@@ -101,21 +144,32 @@ class AppState {
         if (event.state) {
             const { view, path, videoId } = event.state;
 
-            // Sync Path
             this.selectionPath = path || [];
 
-            // Sync Video
             if (view === 'video' && videoId) {
-                // Find video object (might need to wait for videos to load if empty?)
                 const vid = this.videos.find(v => v.id === videoId);
                 if (vid) {
                     this.setActiveVideo(vid);
+                } else if (this.videos.length === 0) {
+                    this.videosLoadingPromise = this.refreshVideos().then(() => {
+                        const found = this.videos.find(v => v.id === videoId);
+                        if (found) {
+                            this.setActiveVideo(found);
+                        } else {
+                            this.setActiveVideo(null);
+                            history.replaceState({ view: 'folder', path: path || [] }, '');
+                        }
+                    }).catch((e) => {
+                        console.error("PopState failed to load videos:", e);
+                        this.setActiveVideo(null);
+                    });
+                } else {
+                    this.setActiveVideo(null);
                 }
             } else {
                 this.setActiveVideo(null);
             }
         } else {
-            // Default/Fallback
             this.selectionPath = [];
             this.setActiveVideo(null);
         }
@@ -140,34 +194,61 @@ class AppState {
         history.back();
     }
 
-    async triggerSync() {
-        if (!this.settings.githubToken || !this.settings.githubRepo) {
-            // throw new Error("GitHub Token and Repo URL are required");
-            // Silent return if not configured
-            return;
+    async triggerSync(): Promise<{ success: boolean; error?: string }> {
+        if (!this.settings.githubTokenPresent || !this.settings.githubRepo) {
+            const message = "GitHub Token and Repo URL are required";
+            this.syncStatus = "error";
+            this.syncError = message;
+            return { success: false, error: message };
         }
 
         this.syncStatus = "syncing";
         this.syncError = null;
 
         try {
-            await import("@tauri-apps/api/core").then(async ({ invoke }) => {
-                await invoke("start_github_sync", {
-                    token: this.settings.githubToken,
-                    repoUrl: this.settings.githubRepo,
-                });
-                await this.refreshAll();
-                this.updateSettings({ lastSyncAt: Date.now() });
-                this.syncStatus = "success";
-                setTimeout(() => {
-                    if (this.syncStatus === "success") this.syncStatus = "idle";
-                }, 3000);
-            });
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("start_github_sync");
+            await this.refreshAll();
+            this.updateSettings({ lastSyncAt: Date.now() });
+            this.syncStatus = "success";
+            setTimeout(() => {
+                if (this.syncStatus === "success") this.syncStatus = "idle";
+            }, 3000);
+            return { success: true };
         } catch (e: any) {
             console.error(e);
+            const errorStr = e.toString ? e.toString() : String(e);
             this.syncStatus = "error";
-            this.syncError = e.toString();
+            this.syncError = errorStr;
+            return { success: false, error: errorStr };
         }
+    }
+
+    async refreshGithubConfig(): Promise<void> {
+        try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            const cfg = await invoke<{ github_repo: string; token_present: boolean }>(
+                "get_github_config",
+            );
+            this.updateSettings({
+                githubRepo: cfg.github_repo || "",
+                githubTokenPresent: cfg.token_present,
+            });
+        } catch (e) {
+            console.error("Failed to load GitHub config:", e);
+        }
+    }
+
+    async playVideoById(videoId: string, atSeconds?: number) {
+        const found = this.videos.find((v) => v.id === videoId);
+        if (found) {
+            if (atSeconds !== undefined) {
+                this.seekToTime = atSeconds;
+            }
+            this.openVideo(found);
+            return true;
+        }
+        return false;
     }
 }
 

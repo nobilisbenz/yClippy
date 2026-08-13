@@ -2,21 +2,56 @@ use tauri::Manager;
 
 mod db;
 mod github_api;
+mod oplog;
+mod play;
 mod sync;
 pub mod sync_engine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let initial_args: Vec<String> = std::env::args().collect();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
+        |app, argv, _cwd| {
+            if let Some(req) = play::parse_play_args(&argv) {
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = play::process_play_request(&app_handle, req).await {
+                        eprintln!("Failed to process CLI play request: {e}");
+                    }
+                });
+            }
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        },
+    ));
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let builder = tauri::Builder::default();
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
+        .setup(move |app| {
             let db_state = db::init_db(app.handle())?;
             app.manage(db_state);
+
+            let pending = play::parse_play_args(&initial_args);
+            if let Some(req) = pending {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = play::process_play_request(&app_handle, req).await {
+                        eprintln!("Failed to process CLI play request: {e}");
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -42,9 +77,18 @@ pub fn run() {
             db::set_db_path,
             db::update_sort_order,
             db::update_clip_sort_order,
+            db::restore_video,
+            db::restore_folder,
+            db::restore_clip,
             db::import_from_yt_renamer,
             db::fetch_video_oembed,
-            sync::start_github_sync
+            db::get_github_config,
+            db::set_github_config,
+            db::clear_github_token,
+            sync::start_github_sync,
+            play::list_videos_for_picker,
+            oplog::pull_remote,
+            oplog::compact_library
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

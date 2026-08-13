@@ -1,7 +1,115 @@
 <script lang="ts">
     import { appState } from "./state.svelte";
+    import {
+        exportDb,
+        importDb,
+        getDbPath,
+        setDbPath,
+        setGithubConfig,
+        clearGithubToken,
+    } from "./db";
 
     let template = $state(appState.settings.clipboardTemplate);
+    let draftRepo = $state(appState.settings.githubRepo);
+    let draftToken = $state("");
+    let tokenConfigured = $state(appState.settings.githubTokenPresent);
+    let isSyncing = $state(false);
+    let isSavingCredentials = $state(false);
+    let localSyncMessage = $state<{ ok: boolean; text: string } | null>(null);
+    let credentialMessage = $state<{ ok: boolean; text: string } | null>(null);
+
+    let confirmState = $state<{
+        open: boolean;
+        title: string;
+        message: string;
+        confirmLabel: string;
+        danger: boolean;
+        withInput: boolean;
+        promptPlaceholder: string;
+        onConfirm: (value?: string) => void;
+    }>({
+        open: false,
+        title: "",
+        message: "",
+        confirmLabel: "Confirm",
+        danger: false,
+        withInput: false,
+        promptPlaceholder: "",
+        onConfirm: () => {},
+    });
+
+    function showConfirm(opts: {
+        title: string;
+        message: string;
+        confirmLabel?: string;
+        danger?: boolean;
+        withInput?: boolean;
+        promptPlaceholder?: string;
+    }): Promise<string | undefined> {
+        return new Promise((resolve) => {
+            confirmState = {
+                open: true,
+                title: opts.title,
+                message: opts.message,
+                confirmLabel: opts.confirmLabel ?? "Confirm",
+                danger: opts.danger ?? false,
+                withInput: opts.withInput ?? false,
+                promptPlaceholder: opts.promptPlaceholder ?? "",
+                onConfirm: (value) => {
+                    confirmState.open = false;
+                    resolve(value);
+                },
+            };
+        });
+    }
+
+    function cancelConfirm() {
+        confirmState.open = false;
+        confirmState.onConfirm(undefined);
+    }
+
+    $effect(() => {
+        draftRepo = appState.settings.githubRepo;
+        tokenConfigured = appState.settings.githubTokenPresent;
+    });
+
+    async function handleSaveCredentials() {
+        isSavingCredentials = true;
+        credentialMessage = null;
+        try {
+            await setGithubConfig(draftRepo, draftToken || null);
+            if (draftToken) {
+                draftToken = "";
+            }
+            await appState.refreshGithubConfig();
+            credentialMessage = {
+                ok: true,
+                text: tokenConfigured ? "Credentials updated" : "Credentials saved",
+            };
+        } catch (e) {
+            credentialMessage = { ok: false, text: `Failed: ${String(e)}` };
+        } finally {
+            isSavingCredentials = false;
+        }
+    }
+
+    async function handleClearToken() {
+        const confirmed = await showConfirm({
+            title: "Clear GitHub token?",
+            message:
+                "Clear the stored GitHub token? Sync will stop working until you add a new one.",
+            confirmLabel: "Clear token",
+            danger: true,
+        });
+        if (!confirmed && confirmed !== "") return;
+        try {
+            await clearGithubToken();
+            await appState.refreshGithubConfig();
+            credentialMessage = { ok: true, text: "Token cleared" };
+        } catch (e) {
+            credentialMessage = { ok: false, text: `Failed: ${String(e)}` };
+        }
+    }
 
     function handleSave() {
         appState.updateSettings({ clipboardTemplate: template });
@@ -12,10 +120,10 @@
         template = `<iframe src="https://www.youtube.com/embed/{id}?start={start}&end={end}" height="360" width="100%" seamless="seamless" frameborder="0" allowfullscreen></iframe>`;
     }
 
-    import { exportDb, importDb, getDbPath, setDbPath } from "./db";
     import { save, open } from "@tauri-apps/plugin-dialog";
     import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
     import { invoke } from "@tauri-apps/api/core";
+    import ConfirmDialog from "./ConfirmDialog.svelte";
 
     let dbPath = $state("Loading...");
 
@@ -40,11 +148,11 @@
                 await setDbPath(path);
                 dbPath = path;
                 await appState.refreshAll();
-                alert("Database path updated successfully!");
+                appState.showToast("Database path updated", "success");
             }
         } catch (e) {
             console.error(e);
-            alert("Failed to change database: " + e);
+            appState.showToast(`Failed to change database: ${String(e)}`, "error");
         }
     }
 
@@ -63,21 +171,22 @@
             if (path) {
                 const data = await exportDb();
                 await writeTextFile(path, JSON.stringify(data, null, 2));
-                alert("Data exported successfully!");
+                appState.showToast("Data exported successfully", "success");
             }
         } catch (e) {
             console.error(e);
-            alert("Export failed: " + e);
+            appState.showToast(`Export failed: ${String(e)}`, "error");
         }
     }
 
     async function handleImport() {
-        if (
-            !confirm(
-                "Importing data will overwrite/merge with existing data. It is recommended to backup first. Continue?",
-            )
-        )
-            return;
+        const confirmed = await showConfirm({
+            title: "Import data?",
+            message:
+                "Importing data will overwrite/merge with existing data. It is recommended to backup first.",
+            confirmLabel: "Continue",
+        });
+        if (confirmed === undefined) return;
 
         try {
             const path = await open({
@@ -95,20 +204,21 @@
                 await importDb(data);
                 await appState.refreshFolders();
                 await appState.refreshVideos();
-                alert("Data imported successfully!");
+                appState.showToast("Data imported successfully", "success");
             }
         } catch (e) {
             console.error(e);
-            alert("Import failed: " + e);
+            appState.showToast(`Import failed: ${String(e)}`, "error");
         }
     }
-async function handleImportFromYtRenamer() {
-        if (
-            !confirm(
-                "Importing from ytRenamer will add videos and clips to your library. Continue?",
-            )
-        )
-            return;
+    async function handleImportFromYtRenamer() {
+        const confirmed = await showConfirm({
+            title: "Import from ytRenamer?",
+            message:
+                "Importing from ytRenamer will add videos and clips to your library.",
+            confirmLabel: "Continue",
+        });
+        if (confirmed === undefined) return;
 
         try {
             const path = await open({
@@ -122,18 +232,37 @@ async function handleImportFromYtRenamer() {
             });
 
             if (path) {
-                const youtubeUrl = prompt("Enter YouTube URL for this clip list:");
+                const youtubeUrl = await showConfirm({
+                    title: "YouTube URL",
+                    message:
+                        "Enter the YouTube URL that this ytRenamer clip list belongs to.",
+                    confirmLabel: "Import",
+                    withInput: true,
+                    promptPlaceholder: "https://youtube.com/watch?v=...",
+                });
                 if (!youtubeUrl) return;
 
                 const content = await readTextFile(path);
                 const count = await invoke("import_from_yt_renamer", { fileContent: content, youtubeUrl });
                 await appState.refreshVideos();
                 await appState.refreshActiveClips();
-                alert(`Successfully imported ${count} clips from ytRenamer!`);
+                appState.showToast(`Imported ${count} clips from ytRenamer`, "success");
             }
         } catch (e) {
             console.error(e);
-            alert("Import failed: " + e);
+            appState.showToast(`Import failed: ${String(e)}`, "error");
+        }
+    }
+
+    async function handleSyncNow() {
+        localSyncMessage = null;
+        isSyncing = true;
+        const result = await appState.triggerSync();
+        isSyncing = false;
+        if (result.success) {
+            localSyncMessage = { ok: true, text: "Sync successful!" };
+        } else {
+            localSyncMessage = { ok: false, text: `Sync failed: ${result.error || "unknown error"}` };
         }
     }
 </script>
@@ -175,7 +304,6 @@ async function handleImportFromYtRenamer() {
             </button>
         </div>
 
-        <!-- GitHub Sync -->
         <div class="mb-6 pt-6 border-t border-zinc-800">
             <h4 class="text-sm font-medium text-white mb-4">GitHub Sync</h4>
             <div class="space-y-4">
@@ -189,7 +317,7 @@ async function handleImportFromYtRenamer() {
                     <input
                         id="repo-url"
                         type="text"
-                        bind:value={appState.settings.githubRepo}
+                        bind:value={draftRepo}
                         placeholder="https://github.com/username/repo.git"
                         class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-600 transition text-sm"
                     />
@@ -199,23 +327,45 @@ async function handleImportFromYtRenamer() {
                         for="gh-token"
                         class="block text-xs font-medium text-zinc-400 mb-1"
                     >
-                        Classic Access Token
+                        Classic Access Token {tokenConfigured ? "(configured — paste to replace)" : ""}
                     </label>
                     <input
                         id="gh-token"
                         type="password"
-                        bind:value={appState.settings.githubToken}
-                        placeholder="ghp_..."
+                        bind:value={draftToken}
+                        placeholder={tokenConfigured ? "•••••••• (already saved)" : "ghp_..."}
                         class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-600 transition text-sm"
                     />
+                    <p class="text-xs text-zinc-500 mt-1">
+                        Stored in app-private config. Never exposed to the webview.
+                    </p>
                 </div>
+                <div class="flex gap-2">
+                    <button
+                        onclick={handleSaveCredentials}
+                        disabled={isSavingCredentials || !draftRepo || !draftToken}
+                        class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white text-sm font-medium transition"
+                    >
+                        {isSavingCredentials ? "Saving…" : "Save Credentials"}
+                    </button>
+                    {#if tokenConfigured}
+                        <button
+                            onclick={handleClearToken}
+                            class="px-4 py-2 bg-zinc-800 hover:bg-red-900 rounded-lg text-zinc-300 text-sm font-medium transition border border-zinc-700"
+                        >
+                            Clear Token
+                        </button>
+                    {/if}
+                </div>
+                {#if credentialMessage}
+                    <p class="text-xs text-center {credentialMessage.ok ? 'text-green-400' : 'text-red-400'}">
+                        {credentialMessage.text}
+                    </p>
+                {/if}
                 <button
-                    onclick={() =>
-                        appState
-                            .triggerSync()
-                            .then(() => alert("Sync successful!"))
-                            .catch((e) => alert("Sync failed: " + e))}
-                    class="w-full py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-zinc-300 font-medium transition border border-zinc-700 hover:border-zinc-500 flex items-center justify-center gap-2"
+                    onclick={handleSyncNow}
+                    disabled={isSyncing || !tokenConfigured || !draftRepo}
+                    class="w-full py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-zinc-300 font-medium transition border border-zinc-700 hover:border-zinc-500 flex items-center justify-center gap-2"
                 >
                     <svg
                         xmlns="http://www.w3.org/2000/svg"
@@ -227,16 +377,21 @@ async function handleImportFromYtRenamer() {
                         stroke-width="2"
                         stroke-linecap="round"
                         stroke-linejoin="round"
-                        class="lucide lucide-refresh-cw"
+                        class="lucide lucide-refresh-cw {isSyncing ? 'animate-spin' : ''}"
                         ><path
                             d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"
                         /><path d="M21 3v5h-5" /><path
                             d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"
                         /><path d="M3 21v-5h5" /></svg
                     >
-                    Sync Now
+                    {isSyncing ? "Syncing..." : "Sync Now"}
                 </button>
-                {#if appState.settings.lastSyncAt}
+                {#if localSyncMessage}
+                    <p class="text-xs text-center {localSyncMessage.ok ? 'text-green-400' : 'text-red-400'}">
+                        {localSyncMessage.text}
+                    </p>
+                {/if}
+                {#if appState.settings.lastSyncAt && localSyncMessage?.ok}
                     <p class="text-xs text-zinc-500 text-center mt-2">
                         Last synced: {new Date(appState.settings.lastSyncAt).toLocaleString()}
                     </p>
@@ -244,7 +399,6 @@ async function handleImportFromYtRenamer() {
             </div>
         </div>
 
-<!-- Data Management -->
         <div class="mb-6 pt-6 border-t border-zinc-800">
             <h4 class="text-sm font-medium text-white mb-4">Data Management</h4>
             <div class="flex gap-4 mb-4">
@@ -269,7 +423,6 @@ async function handleImportFromYtRenamer() {
             </button>
         </div>
 
-        <!-- Database Location -->
         <div class="mb-6 pt-6 border-t border-zinc-800">
             <h4 class="text-sm font-medium text-white mb-2">
                 Database Location
@@ -298,3 +451,15 @@ async function handleImportFromYtRenamer() {
         </div>
     </div>
 </div>
+
+<ConfirmDialog
+    open={confirmState.open}
+    title={confirmState.title}
+    message={confirmState.message}
+    confirmLabel={confirmState.confirmLabel}
+    danger={confirmState.danger}
+    withInput={confirmState.withInput}
+    promptPlaceholder={confirmState.promptPlaceholder}
+    onConfirm={confirmState.onConfirm}
+    onCancel={cancelConfirm}
+/>

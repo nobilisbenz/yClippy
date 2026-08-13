@@ -6089,6 +6089,7 @@ name = "yclippy"
 version = "1.0.0"
 dependencies = [
  "base64 0.21.7",
+ "dirs",
  "reqwest 0.11.27",
  "rusqlite",
  "serde",

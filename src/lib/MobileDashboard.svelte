@@ -3,6 +3,7 @@
     import { type Video, type Folder, formatTime } from "./db";
     import Thumbnail from "./Thumbnail.svelte";
     import FolderPicker from "./FolderPicker.svelte";
+    import { updateSortOrder } from "./db";
 
     let { compact = false }: { compact?: boolean } = $props();
 
@@ -20,6 +21,9 @@
     let creatingFolder = $state(false);
     let newFolderName = $state("");
     let isFolderPickerOpen = $state(false);
+    /// Reorder uses arrows rather than grab handles: a handle needs a drag,
+    /// and drag-and-drop is desktop-only. Arrows are also the accessible path.
+    let reordering = $state(false);
     let folderPickerExcludedFolder = $state<number | undefined>(undefined);
     let folderPickerTitle = $state("Move to folder");
     let folderPickerRef = $state<{
@@ -59,7 +63,37 @@
         return out;
     });
 
+    /// Renumbers the whole list on every move. Writing only the two swapped
+    /// rows leaves the rest with stale or duplicate orders, which is why the
+    /// list used to drift out of the order you put it in.
+    async function move(index: number, delta: number) {
+        const next = index + delta;
+        if (next < 0 || next >= items.length) return;
+
+        const ordered = [...items];
+        const [lifted] = ordered.splice(index, 1);
+        ordered.splice(next, 0, lifted);
+
+        const folders: { id: number; sort_order: number }[] = [];
+        const videos: { id: string; sort_order: number }[] = [];
+        ordered.forEach((item, position) => {
+            if (item.kind === "folder" && item.folder.id !== undefined) {
+                folders.push({ id: item.folder.id, sort_order: position });
+            } else if (item.kind === "video") {
+                videos.push({ id: item.video.id, sort_order: position });
+            }
+        });
+
+        try {
+            await updateSortOrder(folders, videos);
+            await appState.refreshAll();
+        } catch (e) {
+            appState.showToast(`Could not reorder: ${String(e)}`, "error");
+        }
+    }
+
     function startLongPress(target: Video | Folder, e: TouchEvent | MouseEvent) {
+        if (reordering) return;
         longPressTargetEl = e.currentTarget as HTMLElement;
         const isVideo = "title" in target && "thumbnail_url" in target;
         longPressTimer = setTimeout(() => {
@@ -291,7 +325,22 @@
             </div>
         {:else}
             <div class="flex flex-col">
-                {#each items as item (item.kind === "folder" ? `f-${item.folder.id}` : `v-${item.video.id}`)}
+                {#each items as item, rowIndex (item.kind === "folder" ? `f-${item.folder.id}` : `v-${item.video.id}`)}
+                    <div class="flex items-stretch border-b border-[color:var(--border)]">
+                    {#if reordering}
+                        <div class="flex flex-col justify-center shrink-0 border-r border-[color:var(--border)]">
+                            <button
+                                class="size-12 grid place-items-center text-[color:var(--text-dim)] disabled:opacity-25"
+                                disabled={rowIndex === 0}
+                                onclick={(e) => { e.stopPropagation(); move(rowIndex, -1); }}
+                                aria-label="Move up">↑</button>
+                            <button
+                                class="size-12 grid place-items-center text-[color:var(--text-dim)] disabled:opacity-25"
+                                disabled={rowIndex === items.length - 1}
+                                onclick={(e) => { e.stopPropagation(); move(rowIndex, 1); }}
+                                aria-label="Move down">↓</button>
+                        </div>
+                    {/if}
                     {#if item.kind === "folder"}
                         <div
                             role="button"
@@ -324,7 +373,7 @@
                                     ],
                                 };
                             }}
-                            class="min-h-[56px] px-3 flex items-center gap-3 cursor-pointer select-none shrink-0 border-b border-[color:var(--border)] active:bg-[color:var(--surface-hi)]"
+                            class="flex-1 min-w-0 min-h-[56px] px-3 flex items-center gap-3 cursor-pointer select-none active:bg-[color:var(--surface-hi)]"
                         >
                             {#if renamingFolder?.id === item.folder.id}
                                 <input
@@ -380,7 +429,7 @@
                                     ],
                                 };
                             }}
-                            class="min-h-[56px] px-3 flex items-center gap-3 cursor-pointer select-none shrink-0 border-b border-[color:var(--border)] active:bg-[color:var(--surface-hi)]"
+                            class="flex-1 min-w-0 min-h-[56px] px-3 flex items-center gap-3 cursor-pointer select-none active:bg-[color:var(--surface-hi)]"
                         >
                             {#if renamingVideo?.id === item.video.id}
                                 <input
@@ -415,6 +464,7 @@
                             {/if}
                         </div>
                     {/if}
+                    </div>
                 {/each}
             </div>
         {/if}
@@ -461,6 +511,19 @@
                 >
                     <svg class="size-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                </button>
+                <button
+                    onclick={() => (reordering = !reordering)}
+                    class="min-w-[48px] min-h-[48px] flex items-center justify-center rounded-lg {reordering
+                        ? 'text-[color:var(--accent)] bg-[color:var(--surface-hi)]'
+                        : 'hover:bg-zinc-800'}"
+                    title={reordering ? "Done reordering" : "Reorder"}
+                    aria-pressed={reordering}
+                    aria-label="Reorder"
+                >
+                    <svg class="size-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
                     </svg>
                 </button>
                 <button

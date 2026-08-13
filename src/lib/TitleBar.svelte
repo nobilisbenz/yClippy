@@ -1,6 +1,7 @@
 <script lang="ts">
     import { getCurrentWindow } from "@tauri-apps/api/window";
     import { platform } from "@tauri-apps/plugin-os";
+    import { appState } from "./state.svelte";
 
     const appWindow = getCurrentWindow();
     const isAndroid = platform() === "android";
@@ -20,6 +21,13 @@
     function startDrag() {
         appWindow.startDragging().catch((e) => console.error(e));
     }
+
+    const trail = $derived(
+        appState.selectionPath
+            .map((id) => appState.folders.find((f) => f.id === id))
+            .filter((f): f is NonNullable<typeof f> => f !== undefined)
+            .map((f) => ({ id: f.id!, name: f.name })),
+    );
 </script>
 
 <div
@@ -41,11 +49,41 @@
     <div
         class="relative z-10 flex items-center w-full pointer-events-none justify-between"
     >
-        <div class="flex items-center gap-2">
-            <span class="text-sm font-medium text-white/90 shadow-sm"
-                >yClippy</span
+        <!-- The breadcrumb is the title bar. You know which app you are in;
+             where you are in the library is the useful thing to show, and it
+             is the fastest way back up the tree. -->
+        <nav
+            class="flex items-center gap-1 min-w-0 pointer-events-auto text-xs"
+            aria-label="Breadcrumb"
+        >
+            <button
+                class="px-1.5 py-0.5 rounded shrink-0 transition-colors {trail.length === 0
+                    ? 'text-white/90'
+                    : 'text-zinc-500 hover:text-white'}"
+                onclick={() => appState.openFolder([])}
             >
-        </div>
+                Library
+            </button>
+            {#each trail as crumb, i (crumb.id)}
+                <span class="text-zinc-700 shrink-0" aria-hidden="true">›</span>
+                <button
+                    class="px-1.5 py-0.5 rounded truncate max-w-[180px] transition-colors {i ===
+                    trail.length - 1
+                        ? 'text-white/90'
+                        : 'text-zinc-500 hover:text-white'}"
+                    onclick={() =>
+                        appState.openFolder(appState.selectionPath.slice(0, i + 1))}
+                >
+                    {crumb.name}
+                </button>
+            {/each}
+            {#if appState.activeVideo}
+                <span class="text-zinc-700 shrink-0" aria-hidden="true">›</span>
+                <span class="truncate max-w-[240px] text-white/90 px-1.5"
+                    >{appState.activeVideo.title}</span
+                >
+            {/if}
+        </nav>
 
         <div class="flex items-center gap-1 pointer-events-auto">
             <button

@@ -1,376 +1,289 @@
 <script lang="ts">
-    import { onMount, onDestroy } from "svelte";
-    import { type Video, saveVideo, formatTime } from "./db";
+    import { onMount, onDestroy, untrack } from "svelte";
+    import { saveClip, type Video } from "./db";
     import { appState } from "./state.svelte";
-    import ClipSaveModal from "./ClipSaveModal.svelte";
+    import { YouTubeController, formatClock } from "./youtube.svelte";
+    import Track from "./Track.svelte";
     import ClipList from "./ClipList.svelte";
 
-    let { video, seekToTime, seekTo = $bindable() } = $props<{
+    /// Android shell.
+    ///
+    /// The phone's scarce resource is reach, not space, so the track and the
+    /// transport live in the bottom third permanently and the video floats
+    /// above them. Marking a clip is one wide button at the bottom edge —
+    /// the whole flow works with one thumb, which two-button in/out never did.
+    let { video, seekToTime, seekTo = $bindable(), onSeekConsumed } = $props<{
         video: Video;
         seekToTime?: number;
         seekTo?: (t: number) => void;
+        onSeekConsumed?: () => void;
     }>();
 
-    let currentTime = $state(0);
-    let isPaused = $state(true);
-    let isReady = $state(false);
-    let controlsVisible = $state(true);
-    let hideControlsTimer: number | undefined;
+    const initialSeek: number | undefined = untrack(() => seekToTime);
+    const yt = new YouTubeController();
 
-    function resetHideControlsTimer() {
-        if (hideControlsTimer !== undefined) {
-            clearTimeout(hideControlsTimer);
-        }
-        hideControlsTimer = setTimeout(() => {
-            if (!isPaused) controlsVisible = false;
-        }, 3000) as unknown as number;
-    }
+    /// Peek shows the count without covering the transport; the old panel was
+    /// absolutely positioned over it with no way out.
+    type Detent = "closed" | "peek" | "half" | "full";
+    let sheet = $state<Detent>("peek");
+    let naming = $state(false);
+    let clipTitle = $state("");
+    let nameField = $state<HTMLInputElement | null>(null);
+    let landscape = $state(false);
 
-    function showControls() {
-        controlsVisible = true;
-        resetHideControlsTimer();
-    }
-
-    let startTimestamp = $state<number | null>(null);
-    let endTimestamp = $state<number | null>(null);
-    let isSavingClip = $state(false);
-
-    let player: any;
-    let timer: number;
-    let playerContainerId = `native-player-${Math.random().toString(36).slice(2, 9)}`;
-
-    function loadYouTubeApi(): Promise<void> {
-        return new Promise((resolve) => {
-            if (window.YT && window.YT.Player) {
-                resolve();
-                return;
-            }
-            const existing = document.querySelector('script[data-yt-api]');
-            if (existing) {
-                const prev = window.onYouTubeIframeAPIReady;
-                window.onYouTubeIframeAPIReady = () => {
-                    if (prev) prev();
-                    resolve();
-                };
-                return;
-            }
-            const tag = document.createElement("script");
-            tag.src = "https://www.youtube.com/iframe_api";
-            tag.setAttribute("data-yt-api", "true");
-            const firstScriptTag = document.getElementsByTagName("script")[0];
-            firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
-            window.onYouTubeIframeAPIReady = () => resolve();
-        });
-    }
+    const SHEET_HEIGHT: Record<Detent, string> = {
+        closed: "0px",
+        peek: "72px",
+        half: "45dvh",
+        full: "80dvh",
+    };
 
     onMount(async () => {
-        await loadYouTubeApi();
-        if (!video) return;
-        initPlayer();
-
-        timer = setInterval(() => {
-            if (player?.getCurrentTime) {
-                currentTime = player.getCurrentTime();
-            }
-        }, 1000);
+        await yt.mount(video, initialSeek);
+        onSeekConsumed?.();
+        const media = window.matchMedia("(orientation: landscape)");
+        landscape = media.matches;
+        media.addEventListener("change", onOrientation);
     });
 
-    function initPlayer() {
-        const startSeconds = Math.max(video.last_position, video.start_time);
-        const playerVars: any = {
-            playsinline: 1,
-            start: startSeconds,
-            rel: 0,
-            modestbranding: 1,
-            iv_load_policy: 3,
-        };
-        if (video.end_time > 0) {
-            playerVars.end = video.end_time;
-        }
+    onDestroy(async () => {
+        window.matchMedia("(orientation: landscape)").removeEventListener("change", onOrientation);
+        const latest = appState.videos.find((v) => v.id === video.id) ?? video;
+        await yt.destroy(latest);
+        await appState.refreshVideos();
+    });
 
-        player = new window.YT.Player(playerContainerId, {
-            height: "100%",
-            width: "100%",
-            videoId: video.id,
-            playerVars,
-            events: {
-                onReady: (event: any) => {
-                    isReady = true;
-                    if (seekToTime !== undefined && event.target?.seekTo) {
-                        event.target.seekTo(seekToTime, true);
-                    }
-                },
-                onStateChange: onPlayerStateChange,
-            },
-        });
+    function onOrientation(e: MediaQueryListEvent) {
+        landscape = e.matches;
+        if (landscape) sheet = "closed";
     }
 
     $effect(() => {
-        if (seekToTime !== undefined && player?.seekTo) {
-            player.seekTo(seekToTime, true);
-            currentTime = seekToTime;
+        if (seekToTime !== undefined && yt.player) {
+            yt.seek(seekToTime);
+            onSeekConsumed?.();
         }
     });
 
     $effect(() => {
-        seekTo = (t: number) => {
-            if (player?.seekTo) {
-                player.seekTo(t, true);
-                currentTime = t;
-            }
-        };
+        seekTo = (t: number) => yt.seek(t);
     });
 
-    function onPlayerStateChange(event: any) {
-        if (player?.getCurrentTime) {
-            currentTime = player.getCurrentTime();
-        }
-        if (event.data === 1) {
-            isPaused = false;
-        } else if (event.data === 0 || event.data === 2) {
-            isPaused = true;
-        }
-    }
-
-    function togglePlay() {
-        if (!player) return;
-        if (isPaused) {
-            player.playVideo();
-        } else {
-            player.pauseVideo();
-        }
-    }
-
-    function openInRevanced() {
-        const native = window as any;
-        const t = Math.floor(currentTime);
-        if (native.yClippyNative?.openInRevanced) {
-            native.yClippyNative.openInRevanced(video.id, t);
-        } else {
-            window.open(`https://www.youtube.com/watch?v=${video.id}&t=${t}s`, "_blank");
-        }
-    }
-
-    function setStart() {
-        startTimestamp = currentTime;
-    }
-
-    function setEnd() {
-        if (startTimestamp === null) {
-            startTimestamp = Math.max(0, currentTime - 5);
-        }
-        endTimestamp = currentTime;
-        if (player?.pauseVideo) {
-            player.pauseVideo();
-        }
-        isSavingClip = true;
-    }
-
-    function cancelClip() {
-        isSavingClip = false;
-        startTimestamp = null;
-        endTimestamp = null;
-    }
-
-    onDestroy(() => {
-        clearInterval(timer);
-        if (hideControlsTimer !== undefined) clearTimeout(hideControlsTimer);
-        if (player && player.destroy) {
-            try {
-                player.destroy();
-            } catch (e) {
-                console.error("Failed to destroy native player:", e);
-            }
-            player = null;
-        }
-        if (video && video.id) {
-            const positionUpdate: Video = { ...video, last_position: Math.floor(currentTime) };
-            saveVideo(positionUpdate).then(() => appState.refreshVideos()).catch((e) => {
-                console.error("Failed to save native player position:", e);
-            });
-        }
-    });
-
+    /// Back closes the sheet before it leaves the video, so the gesture always
+    /// undoes the most recent thing rather than skipping a level.
     function handleBack() {
-        appState.goBack();
+        if (naming) {
+            naming = false;
+            yt.clearPending();
+        } else if (sheet === "full" || sheet === "half") {
+            sheet = "peek";
+        } else {
+            appState.goBack();
+        }
+    }
+
+    function onMarkTap() {
+        if (yt.pendingStart === null) {
+            yt.markIn();
+        } else {
+            yt.markOut();
+            clipTitle = "";
+            naming = true;
+            queueMicrotask(() => nameField?.focus());
+        }
+    }
+
+    async function commitClip() {
+        if (yt.pendingStart === null) return;
+        const end = yt.pendingEnd ?? yt.currentTime;
+        try {
+            await saveClip({
+                video_id: video.id,
+                start_time: Math.floor(yt.pendingStart),
+                end_time: Math.floor(end),
+                title: clipTitle.trim() || `Clip at ${formatClock(yt.pendingStart)}`,
+                created_at: Date.now(),
+                sort_order: 0,
+            });
+            await appState.refreshActiveClips();
+            appState.showToast("Clip saved", "success");
+        } catch (e) {
+            appState.showToast(`Could not save the clip: ${String(e)}`, "error");
+        }
+        naming = false;
+        yt.clearPending();
+    }
+
+    function openInExternal() {
+        const native = (window as any).yClippyNative;
+        native?.openInRevanced?.(video.id, Math.floor(yt.currentTime));
     }
 </script>
 
-<div class="flex flex-col h-full" data-orientation="portrait">
-    <div
-        class="flex-1 bg-black relative min-h-0"
-        onclick={showControls}
-        onkeydown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                showControls();
-            }
-        }}
-        role="button"
-        tabindex="0"
-        aria-label="Show player controls"
-    >
-        {#if !isReady}
-            <div
-                class="absolute inset-0 z-10 flex items-center justify-center bg-black"
+<div class="flex flex-col h-full min-h-0 bg-black relative">
+    {#if !landscape}
+        <header
+            class="shrink-0 flex items-center gap-2 h-12 px-2 border-b border-[color:var(--border)] bg-[color:var(--surface)]"
+        >
+            <button
+                onclick={handleBack}
+                class="size-11 grid place-items-center rounded text-[color:var(--text-dim)]"
+                aria-label="Back">‹</button
             >
-                <div class="text-white flex flex-col items-center gap-4">
-                    <div
-                        class="animate-spin rounded-full h-8 w-8 border-b-2 border-white"
-                    ></div>
-                    <div>Loading video…</div>
-                </div>
-            </div>
-        {/if}
-
-        <div id={playerContainerId} class="absolute inset-0 w-full h-full"></div>
-
-        {#if isPaused && isReady}
-            <div
-                class="absolute inset-0 z-20 bg-black/30 flex items-center justify-center cursor-pointer"
-                onclick={togglePlay}
-                role="button"
-                tabindex="0"
-                onkeydown={(e) => e.key === "Enter" && togglePlay()}
+            <span class="flex-1 min-w-0 truncate text-sm text-[color:var(--text)]">
+                {video.title}
+            </span>
+            <button
+                onclick={openInExternal}
+                class="size-11 grid place-items-center rounded text-[color:var(--text-dim)]"
+                aria-label="Open in another player">⧉</button
             >
-                <div
-                    class="bg-black/70 rounded-full p-5 hover:scale-110 transition-transform shadow-2xl border border-zinc-600/50"
-                >
-                    <svg class="size-14 text-white" fill="currentColor" viewBox="0 0 24 24">
-                        <path d="M8 5v14l11-7z" />
-                    </svg>
-                </div>
-            </div>
-        {/if}
+        </header>
+    {/if}
+
+    <!-- Sticky player. -->
+    <div class="shrink-0 bg-black" style="aspect-ratio: 16/9">
+        <div id={yt.elementId} class="w-full h-full"></div>
     </div>
 
-    <div
-        class="border-t border-zinc-900 bg-zinc-950 p-3 flex flex-col gap-3 shrink-0 transition-opacity duration-300 {controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'}"
-        style="padding-bottom: calc(12px + var(--safe-bottom));"
-    >
-        <div class="flex items-center justify-between gap-3">
-            <div class="text-xl font-mono text-white t-num">
-                {formatTime(currentTime)}
-            </div>
-            <div class="flex items-center gap-2">
-                <button
-                    onclick={handleBack}
-                    class="min-w-[48px] min-h-[48px] flex items-center justify-center bg-zinc-800 hover:bg-zinc-700 rounded-full transition-colors"
-                    aria-label="Back"
-                >
-                    <svg
-                        class="size-5 text-zinc-300"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                    >
-                        <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M10 19l-7-7m0 0l7-7m-7 7h18"
-                        />
-                    </svg>
-                </button>
-
-                <button
-                    onclick={togglePlay}
-                    class="min-w-[48px] min-h-[48px] flex items-center justify-center bg-zinc-800 hover:bg-zinc-700 rounded-full transition-colors"
-                    aria-label={isPaused ? "Play" : "Pause"}
-                >
-                    {#if isPaused}
-                        <svg class="size-5 text-zinc-300" fill="currentColor" viewBox="0 0 24 24">
-                            <path d="M8 5v14l11-7z" />
-                        </svg>
-                    {:else}
-                        <svg class="size-5 text-zinc-300" fill="currentColor" viewBox="0 0 24 24">
-                            <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
-                        </svg>
-                    {/if}
-                </button>
-
-                <button
-                    onclick={setStart}
-                    class="min-h-[48px] px-4 bg-zinc-700 hover:bg-zinc-600 text-white rounded-lg text-sm font-medium transition-colors"
-                >
-                    Set Start
-                </button>
-
-                <button
-                    onclick={setEnd}
-                    class="min-h-[48px] px-5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition-colors"
-                >
-                    Clip
-                </button>
-            </div>
-        </div>
-
-        <button
-            onclick={openInRevanced}
-            class="min-h-[48px] w-full px-4 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
-            title="Hand off to ReVanced Extended for background playback"
-        >
-            <svg class="size-4" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M10 9V15L15 12L10 9M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2M12 20C7.59 20 4 16.41 4 12C4 7.59 7.59 4 12 4C16.41 4 20 7.59 20 12C20 16.41 16.41 20 12 20Z" />
-            </svg>
-            Open in ReVanced Extended
-        </button>
-
-        <button
-            onclick={() => (appState.isClipsSidebarOpen = !appState.isClipsSidebarOpen)}
-            class="min-h-[48px] w-full px-4 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
-            aria-label="Clips"
-        >
-            <svg
-                class="size-4"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-            >
-                <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"
+    {#if !landscape}
+        <!-- Transport, in the bottom third where thumbs are. -->
+        <div class="flex-1 min-h-0 flex flex-col justify-end">
+            <div class="px-3 pt-3 pb-1">
+                <Track
+                    clips={appState.activeClips}
+                    duration={yt.duration}
+                    currentTime={yt.currentTime}
+                    watched={video.last_position}
+                    pendingStart={yt.pendingStart}
+                    pendingEnd={yt.pendingEnd}
+                    height={64}
+                    onSeek={(t) => yt.seek(t)}
+                    onClipTap={(clip) => yt.seek(clip.start_time)}
+                    onPendingChange={(start, end) => {
+                        yt.pendingStart = start;
+                        yt.pendingEnd = end;
+                    }}
                 />
-            </svg>
-            Clips ({appState.activeClips.length})
-        </button>
-    </div>
-
-    {#if appState.isClipsSidebarOpen}
-        <div
-            class="fixed md:absolute inset-x-0 bottom-0 md:right-0 md:left-auto md:top-0 md:bottom-auto md:w-80 max-h-[70vh] md:max-h-full border-t md:border-t-0 md:border-l border-zinc-900 bg-zinc-950 shrink-0 overflow-y-auto z-40 shadow-2xl rounded-t-2xl md:rounded-none"
-            style="padding-bottom: calc(12px + var(--safe-bottom));"
-        >
-            <div class="sticky top-0 bg-zinc-950 border-b border-zinc-900 p-4 flex items-center justify-between">
-                <span class="font-bold">Clips</span>
-                <button
-                    onclick={() => (appState.isClipsSidebarOpen = false)}
-                    class="min-w-[48px] min-h-[48px] flex items-center justify-center hover:bg-zinc-800 rounded-full"
-                    aria-label="Close Clips"
-                >
-                    <svg class="size-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                </button>
             </div>
-            <ClipList videoId={video.id} seekTo={(t) => {
-                currentTime = t;
-                if (player?.seekTo) {
-                    player.seekTo(t, true);
-                }
-            }} />
+
+            <div class="flex items-center justify-center gap-2 px-3 pb-2">
+                <button
+                    class="size-14 grid place-items-center rounded-full text-[color:var(--text-dim)] active:bg-[color:var(--surface-hi)]"
+                    onclick={() => yt.skip(-10)}
+                    aria-label="Back 10 seconds">⏮</button
+                >
+                <button
+                    class="size-14 grid place-items-center rounded-full text-2xl text-[color:var(--text)] active:bg-[color:var(--surface-hi)]"
+                    onclick={() => yt.toggle()}
+                    aria-label={yt.isPaused ? "Play" : "Pause"}
+                >
+                    {yt.isPaused ? "▶" : "❚❚"}
+                </button>
+                <button
+                    class="size-14 grid place-items-center rounded-full text-[color:var(--text-dim)] active:bg-[color:var(--surface-hi)]"
+                    onclick={() => yt.skip(10)}
+                    aria-label="Forward 10 seconds">⏭</button
+                >
+            </div>
         </div>
     {/if}
 
-    {#if isSavingClip && startTimestamp !== null && endTimestamp !== null}
-        <ClipSaveModal
-            {video}
-            startTime={startTimestamp}
-            endTime={endTimestamp}
-            onClose={cancelClip}
-            onSaved={cancelClip}
-        />
+    <!-- Clips sheet: a scrim and three detents, never covering the transport
+         at peek, and back dismisses it. -->
+    {#if !landscape && sheet !== "closed"}
+        {#if sheet === "half" || sheet === "full"}
+            <button
+                class="absolute inset-0 z-20 bg-black/50"
+                aria-label="Close clips"
+                onclick={() => (sheet = "peek")}
+            ></button>
+        {/if}
+        <div
+            class="absolute inset-x-0 bottom-0 z-30 flex flex-col rounded-t-2xl border-t border-[color:var(--border-hi)] bg-[color:var(--surface)] transition-[height] duration-200"
+            style="height: {SHEET_HEIGHT[sheet]}; padding-bottom: var(--safe-bottom)"
+        >
+            <button
+                class="shrink-0 h-[72px] px-4 flex items-center gap-3 text-left"
+                onclick={() => (sheet = sheet === "peek" ? "half" : "peek")}
+                aria-label={sheet === "peek" ? "Open clips" : "Collapse clips"}
+            >
+                <span class="block w-9 h-1 rounded-full bg-[color:var(--border-hi)]"></span>
+                <span class="text-sm text-[color:var(--text)]">
+                    Clips <span class="text-[color:var(--text-faint)]"
+                        >{appState.activeClips.length}</span
+                    >
+                </span>
+                <span class="flex-1"></span>
+                {#if appState.activeClips[0]}
+                    <span class="text-[11px] t-num text-[color:var(--text-faint)]">
+                        next {formatClock(appState.activeClips[0].start_time)}
+                    </span>
+                {/if}
+            </button>
+            {#if sheet !== "peek"}
+                <div class="flex-1 min-h-0 overflow-y-auto">
+                    <ClipList videoId={video.id} seekTo={(t) => yt.seek(t)} />
+                </div>
+            {/if}
+        </div>
+    {/if}
+
+    <!-- One button clips. Tap for in, tap again for out, then name it. -->
+    {#if !landscape}
+        <div
+            class="absolute inset-x-0 bottom-0 z-40"
+            style="padding-bottom: var(--safe-bottom)"
+        >
+            {#if naming}
+                <form
+                    class="flex items-center gap-2 p-2 bg-[color:var(--surface)] border-t border-[color:var(--border-hi)]"
+                    onsubmit={(e) => {
+                        e.preventDefault();
+                        commitClip();
+                    }}
+                >
+                    <input
+                        bind:this={nameField}
+                        bind:value={clipTitle}
+                        placeholder="Name this clip…"
+                        class="flex-1 min-w-0 h-12 bg-[color:var(--bg)] border border-[color:var(--border-hi)] rounded px-3 text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)]"
+                    />
+                    <button
+                        type="submit"
+                        class="h-12 px-4 rounded bg-[color:var(--accent)] text-white text-sm shrink-0"
+                        >Save</button
+                    >
+                    <button
+                        type="button"
+                        class="h-12 px-3 text-[color:var(--text-faint)] shrink-0"
+                        onclick={() => {
+                            naming = false;
+                            yt.clearPending();
+                        }}>✕</button
+                    >
+                </form>
+            {:else if sheet === "peek" || sheet === "closed"}
+                <button
+                    class="w-full h-14 text-sm tracking-[0.15em] uppercase transition-colors {yt.pendingStart !==
+                    null
+                        ? 'bg-[color:var(--accent)] text-white'
+                        : 'bg-[color:var(--surface-hi)] text-[color:var(--text-dim)]'}"
+                    style="margin-bottom: 72px"
+                    onclick={onMarkTap}
+                >
+                    {yt.pendingStart === null ? "Mark in" : "Mark out"}
+                </button>
+            {/if}
+        </div>
+    {/if}
+
+    {#if landscape}
+        <!-- Rotating means you stopped clipping and started watching. -->
+        <button
+            class="absolute top-2 left-2 z-30 size-11 grid place-items-center rounded-full bg-black/60 text-white"
+            onclick={handleBack}
+            aria-label="Back">‹</button
+        >
     {/if}
 </div>

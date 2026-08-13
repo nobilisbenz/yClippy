@@ -13,6 +13,7 @@
   import { platform } from "@tauri-apps/plugin-os";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { takePendingPlay } from "./lib/db";
 
   const isAndroid = platform() === "android";
 
@@ -27,6 +28,12 @@
       pendingSharedVideoId = videoId;
     };
 
+    // A `yclippy://play?v=…&t=…` deep link, or a YouTube link opened with
+    // yClippy. Known videos play at the timestamp; unknown ones offer to import.
+    (window as any).__yclippyOnPlay = (p: { videoId: string; startSeconds: number }) => {
+      play(p.videoId, p.startSeconds);
+    };
+
     const native = window as any;
     if (isAndroid && native.yClippyNative?.onAppReady) {
       native.yClippyNative.onAppReady();
@@ -39,16 +46,34 @@
       }
     });
 
+    async function play(videoId: string, atSeconds: number | null | undefined) {
+      const at = atSeconds && atSeconds > 0 ? atSeconds : undefined;
+      await appState.refreshVideos();
+      const ok = await appState.playVideoById(videoId, at);
+      if (!ok) {
+        pendingSharedVideoId = videoId;
+      }
+    }
+
     listen<{ video_id: string; at_seconds: number }>("yclippy://play", async (event) => {
       const payload = event.payload;
       if (!payload?.video_id) return;
-      const at = payload.at_seconds && payload.at_seconds > 0 ? payload.at_seconds : undefined;
-      await appState.refreshVideos();
-      const ok = await appState.playVideoById(payload.video_id, at);
-      if (!ok) {
-        pendingSharedVideoId = payload.video_id;
-      }
+      // Claim the slot so the drain below cannot replay the same request.
+      await takePendingPlay().catch(() => null);
+      await play(payload.video_id, payload.at_seconds);
     }).catch((e) => console.error("Failed to subscribe to play event:", e));
+
+    listen("yclippy://library-changed", () => {
+      appState.refreshAll().catch((e) => console.error("Refresh failed:", e));
+    }).catch((e) => console.error("Failed to subscribe to library event:", e));
+
+    // A `yclippy play` on a cold start emits before this webview exists, so the
+    // request is parked in Rust and collected here instead of being lost.
+    takePendingPlay()
+      .then((req) => {
+        if (req?.video_id) play(req.video_id, req.at_seconds);
+      })
+      .catch((e) => console.error("Failed to drain pending play:", e));
   });
 </script>
 

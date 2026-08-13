@@ -166,6 +166,10 @@
         const urlWithTs = `https://www.youtube.com/watch?v=${videoId}&t=${seconds}s`;
         const endSeconds = Math.floor(clip.end_time);
         const title = clip.title || "Clip";
+        // `{url_clean}` carries no `t=`. The vault stores canonical URLs and
+        // keeps the timestamp as its own field, so a line that writes both
+        // would say the same thing twice.
+        const urlClean = `https://www.youtube.com/watch?v=${videoId}`;
         return template
             .replace(/\\n/g, "\n")
             .replace(/{id}/gi, videoId)
@@ -174,6 +178,7 @@
             .replace(/{end}/gi, endSeconds.toString())
             .replace(/{end_hms}/gi, formatHMS(endSeconds))
             .replace(/{title}/gi, title)
+            .replace(/{url_clean}/gi, urlClean)
             .replace(/{url}/gi, urlWithTs);
     }
 

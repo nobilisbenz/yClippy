@@ -4,6 +4,7 @@
     import VideoPlayer from "./VideoPlayer.svelte";
     import NativePlayer from "./NativePlayer.svelte";
     import ClipList from "./ClipList.svelte";
+    import ContinueWatching from "./ContinueWatching.svelte";
     import { appState } from "./state.svelte";
     import { platform } from "@tauri-apps/plugin-os";
 
@@ -29,6 +30,8 @@
                 {#key appState.activeVideo.id}
                     <NativePlayer
                         video={appState.activeVideo}
+                        seekToTime={appState.seekToTime}
+                        onSeekConsumed={() => appState.consumeSeek()}
                         bind:seekTo
                     />
                 {/key}
@@ -39,11 +42,20 @@
             {#key appState.activeVideo.id}
                 <VideoPlayer
                     video={appState.activeVideo}
+                    seekToTime={appState.seekToTime}
+                    onSeekConsumed={() => appState.consumeSeek()}
                     bind:seekTo
                 />
             {/key}
         {:else}
-            <Dashboard />
+            <!-- The rail is the only library on desktop; a second Dashboard here
+                 gave two trees with independent selections. -->
+            <div class="md:hidden flex-1 min-h-0">
+                <Dashboard />
+            </div>
+            <div class="hidden md:flex flex-1 min-h-0">
+                <ContinueWatching />
+            </div>
         {/if}
     </main>
 

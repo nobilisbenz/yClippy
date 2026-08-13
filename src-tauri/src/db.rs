@@ -23,12 +23,17 @@ struct AppConfig {
     db_path: Option<String>,
     github_token: Option<String>,
     github_repo: Option<String>,
+    /// The yalive vault on this machine. Optional: sync works without it via
+    /// the Contents API. Setting it lets desktop mirror the library into
+    /// `<vault>/.notes/yclippy/` so an ordinary `yalive sync` carries it too.
+    vault_path: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct StoredConfig {
     pub github_token: Option<String>,
     pub github_repo: Option<String>,
+    pub vault_path: Option<String>,
 }
 
 pub fn load_config_pub(app: &AppHandle) -> StoredConfig {
@@ -36,6 +41,7 @@ pub fn load_config_pub(app: &AppHandle) -> StoredConfig {
     StoredConfig {
         github_token: cfg.github_token,
         github_repo: cfg.github_repo,
+        vault_path: cfg.vault_path,
     }
 }
 
@@ -77,6 +83,13 @@ fn current_time() -> i64 {
         .as_millis() as i64
 }
 
+/// Exposed so sync tests can build a real schema in memory rather than
+/// asserting against a hand-written one that could drift from production.
+#[cfg(test)]
+pub fn setup_db_for_tests(conn: &Connection) -> Result<()> {
+    setup_db(conn)
+}
+
 fn setup_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS videos (
@@ -108,6 +121,7 @@ fn setup_db(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE videos ADD COLUMN deleted_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE videos ADD COLUMN last_writer TEXT", []);
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS clips (
@@ -137,6 +151,7 @@ fn setup_db(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE clips ADD COLUMN deleted_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE clips ADD COLUMN last_writer TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE clips ADD COLUMN sort_order INTEGER DEFAULT 0",
         [],
@@ -168,6 +183,7 @@ fn setup_db(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE folders ADD COLUMN deleted_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE folders ADD COLUMN last_writer TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE folders ADD COLUMN sort_order INTEGER DEFAULT 0",
         [],
@@ -353,6 +369,7 @@ pub fn set_db_path(app: AppHandle, state: State<DbState>, path: String) -> Resul
 pub struct GithubConfigPublic {
     pub github_repo: String,
     pub token_present: bool,
+    pub vault_path: String,
 }
 
 #[tauri::command]
@@ -365,6 +382,7 @@ pub fn get_github_config(app: AppHandle) -> Result<GithubConfigPublic, String> {
             .as_ref()
             .map(|t| !t.is_empty())
             .unwrap_or(false),
+        vault_path: config.vault_path.unwrap_or_default(),
     })
 }
 
@@ -373,8 +391,23 @@ pub fn set_github_config(
     app: AppHandle,
     github_repo: String,
     github_token: Option<String>,
+    vault_path: Option<String>,
 ) -> Result<(), String> {
     let mut config = load_config(&app);
+    if let Some(path) = vault_path {
+        let trimmed = path.trim().to_string();
+        if trimmed.is_empty() {
+            config.vault_path = None;
+        } else {
+            // Checked now rather than at sync time, where a bad path would
+            // read as a sync failure.
+            let dir = std::path::Path::new(&trimmed);
+            if !dir.is_dir() {
+                return Err(format!("{trimmed} is not a directory"));
+            }
+            config.vault_path = Some(trimmed);
+        }
+    }
     config.github_repo = if github_repo.is_empty() {
         None
     } else {
@@ -472,18 +505,7 @@ pub fn save_folder(state: State<DbState>, app: AppHandle, folder: Folder) -> Res
 
     drop(conn);
 
-    let snapshot = crate::db::Folder {
-        id: Some(id),
-        uid: Some(uid.clone()),
-        name: folder.name.clone(),
-        created_at: folder.created_at,
-        updated_at: now,
-        deleted_at: folder.deleted_at,
-        sort_order: folder.sort_order,
-        parent_id: folder.parent_id,
-    };
-    let fields = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
-    let _ = crate::oplog::append_upsert(&app, "folder", &uid, fields);
+    let _ = crate::oplog::stamp(&app, "folder", &uid);
 
     Ok(id)
 }
@@ -545,7 +567,7 @@ pub fn delete_folder(state: State<DbState>, app: AppHandle, id: i64) -> Result<(
     .map_err(|e| e.to_string())?;
 
     if let Some(uid) = uid {
-        let _ = crate::oplog::append_delete(&app, "folder", &uid);
+        let _ = crate::oplog::stamp(&app, "folder", &uid);
     }
 
     Ok(())
@@ -614,22 +636,7 @@ pub fn save_video(state: State<DbState>, app: AppHandle, video: Video) -> Result
     ).map_err(|e| e.to_string())?;
     drop(conn);
 
-    let snapshot = crate::db::Video {
-        id: video.id.clone(),
-        title: video.title.clone(),
-        thumbnail_url: video.thumbnail_url.clone(),
-        duration: video.duration,
-        last_position: video.last_position,
-        created_at: video.created_at,
-        updated_at: now,
-        deleted_at: video.deleted_at,
-        folder_id,
-        start_time: video.start_time,
-        end_time: video.end_time,
-        sort_order: video.sort_order,
-    };
-    let fields = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
-    let _ = crate::oplog::append_upsert(&app, "video", &video.id, fields);
+    let _ = crate::oplog::stamp(&app, "video", &video.id);
 
     Ok(())
 }
@@ -668,7 +675,7 @@ pub fn save_clip(state: State<DbState>, app: AppHandle, clip: Clip) -> Result<()
     let conn = state.conn.lock().unwrap();
     let now = current_time();
 
-    let (id, uid) = if let Some(id) = clip.id {
+    let (_id, uid) = if let Some(id) = clip.id {
         let uid = match clip.uid.clone().filter(|s| !s.is_empty()) {
             Some(u) => u,
             None => {
@@ -701,20 +708,7 @@ pub fn save_clip(state: State<DbState>, app: AppHandle, clip: Clip) -> Result<()
     };
     drop(conn);
 
-    let snapshot = crate::db::Clip {
-        id: Some(id),
-        uid: Some(uid.clone()),
-        video_id: clip.video_id.clone(),
-        start_time: clip.start_time,
-        end_time: clip.end_time,
-        title: clip.title.clone(),
-        created_at: clip.created_at,
-        updated_at: now,
-        deleted_at: clip.deleted_at,
-        sort_order: clip.sort_order,
-    };
-    let fields = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
-    let _ = crate::oplog::append_upsert(&app, "clip", &uid, fields);
+    let _ = crate::oplog::stamp(&app, "clip", &uid);
 
     Ok(())
 }
@@ -739,7 +733,7 @@ pub fn delete_clip(state: State<DbState>, app: AppHandle, id: i32) -> Result<(),
     .map_err(|e| e.to_string())?;
 
     if let Some(uid) = uid {
-        let _ = crate::oplog::append_delete(&app, "clip", &uid);
+        let _ = crate::oplog::stamp(&app, "clip", &uid);
     }
     Ok(())
 }
@@ -815,7 +809,7 @@ pub fn delete_video(state: State<DbState>, app: AppHandle, id: String) -> Result
     )
     .map_err(|e| e.to_string())?;
 
-    let _ = crate::oplog::append_delete(&app, "video", &id);
+    let _ = crate::oplog::stamp(&app, "video", &id);
 
     Ok(())
 }
@@ -1032,32 +1026,9 @@ pub fn restore_video(state: State<DbState>, app: AppHandle, id: String) -> Resul
     )
     .map_err(|e| e.to_string())?;
 
-    let snapshot: Option<crate::db::Video> = conn
-        .query_row(
-            "SELECT id, title, thumbnail_url, duration, last_position, created_at, updated_at, deleted_at, folder_id, start_time, end_time, sort_order FROM videos WHERE id = ?1",
-            params![id.clone()],
-            |row| Ok(crate::db::Video {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                thumbnail_url: row.get(2)?,
-                duration: row.get(3)?,
-                last_position: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                deleted_at: row.get(7)?,
-                folder_id: row.get(8)?,
-                start_time: row.get(9)?,
-                end_time: row.get(10)?,
-                sort_order: row.get(11)?,
-            }),
-        )
-        .ok();
     drop(conn);
 
-    if let Some(v) = snapshot {
-        let fields = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
-        let _ = crate::oplog::append_upsert(&app, "video", &id, fields);
-    }
+    let _ = crate::oplog::stamp(&app, "video", &id);
     Ok(())
 }
 
@@ -1091,8 +1062,7 @@ pub fn restore_folder(state: State<DbState>, app: AppHandle, id: i64) -> Result<
 
     if let Some(folder) = snapshot {
         if let Some(uid) = folder.uid.clone() {
-            let fields = serde_json::to_value(&folder).unwrap_or(serde_json::Value::Null);
-            let _ = crate::oplog::append_upsert(&app, "folder", &uid, fields);
+            let _ = crate::oplog::stamp(&app, "folder", &uid);
         }
     }
     Ok(())
@@ -1130,8 +1100,7 @@ pub fn restore_clip(state: State<DbState>, app: AppHandle, id: i32) -> Result<()
 
     if let Some(clip) = snapshot {
         if let Some(uid) = clip.uid.clone() {
-            let fields = serde_json::to_value(&clip).unwrap_or(serde_json::Value::Null);
-            let _ = crate::oplog::append_upsert(&app, "clip", &uid, fields);
+            let _ = crate::oplog::stamp(&app, "clip", &uid);
         }
     }
     Ok(())
@@ -1183,76 +1152,8 @@ pub fn update_clip_sort_order(state: State<DbState>, clips: Vec<SortItem>) -> Re
 
 // Internal methods for Sync Engine
 
-pub fn get_all_folders_internal(conn: &Connection) -> Result<Vec<Folder>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT id, uid, name, created_at, updated_at, deleted_at, sort_order, parent_id FROM folders",
-    )?;
-    let folder_iter = stmt.query_map([], |row| {
-        Ok(Folder {
-            id: row.get(0)?,
-            uid: row.get(1)?,
-            name: row.get(2)?,
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
-            deleted_at: row.get(5)?,
-            sort_order: row.get(6)?,
-            parent_id: row.get(7)?,
-        })
-    })?;
-    let mut folders = Vec::new();
-    for f in folder_iter {
-        folders.push(f?);
-    }
-    Ok(folders)
-}
 
-pub fn get_all_videos_internal(conn: &Connection) -> Result<Vec<Video>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT id, title, thumbnail_url, duration, last_position, created_at, updated_at, deleted_at, folder_id, start_time, end_time, sort_order FROM videos")?;
-    let video_iter = stmt.query_map([], |row| {
-        Ok(Video {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            thumbnail_url: row.get(2)?,
-            duration: row.get(3)?,
-            last_position: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
-            deleted_at: row.get(7)?,
-            folder_id: row.get(8)?,
-            start_time: row.get(9)?,
-            end_time: row.get(10)?,
-            sort_order: row.get(11)?,
-        })
-    })?;
-    let mut videos = Vec::new();
-    for v in video_iter {
-        videos.push(v?);
-    }
-    Ok(videos)
-}
 
-pub fn get_all_clips_internal(conn: &Connection) -> Result<Vec<Clip>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT id, uid, video_id, start_time, end_time, title, created_at, updated_at, deleted_at, sort_order FROM clips")?;
-    let clip_iter = stmt.query_map([], |row| {
-        Ok(Clip {
-            id: row.get(0)?,
-            uid: row.get(1)?,
-            video_id: row.get(2)?,
-            start_time: row.get(3)?,
-            end_time: row.get(4)?,
-            title: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
-            deleted_at: row.get(8)?,
-            sort_order: row.get(9)?,
-        })
-    })?;
-    let mut clips = Vec::new();
-    for c in clip_iter {
-        clips.push(c?);
-    }
-    Ok(clips)
-}
 
 #[allow(dead_code)]
 pub fn upsert_folder_internal(conn: &Connection, folder: &Folder) -> Result<(), rusqlite::Error> {

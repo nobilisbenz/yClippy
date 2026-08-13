@@ -3,9 +3,10 @@ use tauri::Manager;
 mod db;
 mod github_api;
 mod oplog;
-mod play;
+pub mod play;
 mod sync;
 pub mod sync_engine;
+pub mod wire;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -14,7 +15,7 @@ pub fn run() {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
         |app, argv, _cwd| {
-            if let Some(req) = play::parse_play_args(&argv) {
+            if let Some(play::Command::Play(req)) = play::parse_play_args(&argv) {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = play::process_play_request(&app_handle, req).await {
@@ -41,9 +42,9 @@ pub fn run() {
         .setup(move |app| {
             let db_state = db::init_db(app.handle())?;
             app.manage(db_state);
+            app.manage(play::PendingPlay::default());
 
-            let pending = play::parse_play_args(&initial_args);
-            if let Some(req) = pending {
+            if let Some(play::Command::Play(req)) = play::parse_play_args(&initial_args) {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = play::process_play_request(&app_handle, req).await {
@@ -87,8 +88,7 @@ pub fn run() {
             db::clear_github_token,
             sync::start_github_sync,
             play::list_videos_for_picker,
-            oplog::pull_remote,
-            oplog::compact_library
+            play::take_pending_play
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

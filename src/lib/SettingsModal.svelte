@@ -11,6 +11,7 @@
 
     let template = $state(appState.settings.clipboardTemplate);
     let draftRepo = $state(appState.settings.githubRepo);
+    let draftVault = $state(appState.settings.vaultPath);
     let draftToken = $state("");
     let tokenConfigured = $state(appState.settings.githubTokenPresent);
     let isSyncing = $state(false);
@@ -70,6 +71,7 @@
 
     $effect(() => {
         draftRepo = appState.settings.githubRepo;
+        draftVault = appState.settings.vaultPath;
         tokenConfigured = appState.settings.githubTokenPresent;
     });
 
@@ -77,7 +79,7 @@
         isSavingCredentials = true;
         credentialMessage = null;
         try {
-            await setGithubConfig(draftRepo, draftToken || null);
+            await setGithubConfig(draftRepo, draftToken || null, draftVault);
             if (draftToken) {
                 draftToken = "";
             }
@@ -116,8 +118,29 @@
         appState.isSettingsModalOpen = false;
     }
 
+    // Three shapes a clip gets copied as. `@video` and `clip:` are what the
+    // vault understands: the first makes the moment a section-level fact, the
+    // second attaches it to a quiz card so it plays as an answer in yReviewy.
+    const PRESETS = [
+        {
+            name: "Embed",
+            hint: "An iframe for a web page",
+            value: `<iframe src="https://www.youtube.com/embed/{id}?start={start}&end={end}" height="360" width="100%" seamless="seamless" frameborder="0" allowfullscreen></iframe>`,
+        },
+        {
+            name: "@video line",
+            hint: "A moment, indexed and replayable from the vault",
+            value: `@video {url_clean} {start_hms}  {title}`,
+        },
+        {
+            name: "clip: line",
+            hint: "Attach to a quiz block — plays as the answer",
+            value: `clip: {url_clean} {start_hms}-{end_hms}  {title}`,
+        },
+    ];
+
     function handleReset() {
-        template = `<iframe src="https://www.youtube.com/embed/{id}?start={start}&end={end}" height="360" width="100%" seamless="seamless" frameborder="0" allowfullscreen></iframe>`;
+        template = PRESETS[0].value;
     }
 
     import { save, open } from "@tauri-apps/plugin-dialog";
@@ -130,6 +153,15 @@
     $effect(() => {
         getDbPath().then((p) => (dbPath = p));
     });
+
+    async function handlePickVault() {
+        try {
+            const picked = await open({ directory: true, title: "Choose your vault folder" });
+            if (typeof picked === "string") draftVault = picked;
+        } catch (e) {
+            appState.showToast(`Could not open the picker: ${String(e)}`, "error");
+        }
+    }
 
     async function handleChangeDb() {
         try {
@@ -260,7 +292,10 @@
         const result = await appState.triggerSync();
         isSyncing = false;
         if (result.success) {
-            localSyncMessage = { ok: true, text: "Sync successful!" };
+            localSyncMessage = {
+                ok: true,
+                text: result.detail ? `Synced — ${result.detail}` : "Synced",
+            };
         } else {
             localSyncMessage = { ok: false, text: `Sync failed: ${result.error || "unknown error"}` };
         }
@@ -289,7 +324,24 @@
                 <code class="bg-zinc-800 px-1 rounded">{"{end}"}</code>
                 <code class="bg-zinc-800 px-1 rounded">{"{title}"}</code>
                 <code class="bg-zinc-800 px-1 rounded">{"{url}"}</code>
+                <code class="bg-zinc-800 px-1 rounded">{"{start_hms}"}</code>
+                <code class="bg-zinc-800 px-1 rounded">{"{end_hms}"}</code>
+                <code class="bg-zinc-800 px-1 rounded">{"{url_clean}"}</code>
             </p>
+            <div class="flex flex-wrap gap-2 mb-2">
+                {#each PRESETS as preset (preset.name)}
+                    <button
+                        onclick={() => (template = preset.value)}
+                        title={preset.hint}
+                        class="px-2.5 py-1 text-xs rounded border transition {template ===
+                        preset.value
+                            ? 'border-[color:var(--accent)] text-[color:var(--text)]'
+                            : 'border-zinc-800 text-zinc-400 hover:border-zinc-700'}"
+                    >
+                        {preset.name}
+                    </button>
+                {/each}
+            </div>
             <textarea
                 id="template"
                 bind:value={template}
@@ -324,6 +376,34 @@
                 </div>
                 <div>
                     <label
+                        for="vault-path"
+                        class="block text-xs font-medium text-zinc-400 mb-1"
+                    >
+                        Vault folder <span class="text-zinc-600">(optional)</span>
+                    </label>
+                    <div class="flex gap-2">
+                        <input
+                            id="vault-path"
+                            type="text"
+                            bind:value={draftVault}
+                            placeholder="~/Notes"
+                            class="flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-600 transition text-sm"
+                        />
+                        <button
+                            onclick={handlePickVault}
+                            class="px-3 py-2 text-sm rounded-lg border border-zinc-800 text-zinc-300 hover:border-zinc-700 transition shrink-0"
+                        >
+                            Browse
+                        </button>
+                    </div>
+                    <p class="text-[11px] text-zinc-500 mt-1">
+                        Set this and desktop sync also writes the library to
+                        <code class="bg-zinc-800 px-1 rounded">&lt;vault&gt;/.notes/yclippy/</code>,
+                        so <code class="bg-zinc-800 px-1 rounded">yalive sync</code> carries it through git.
+                    </p>
+                </div>
+                <div>
+                    <label
                         for="gh-token"
                         class="block text-xs font-medium text-zinc-400 mb-1"
                     >
@@ -343,7 +423,7 @@
                 <div class="flex gap-2">
                     <button
                         onclick={handleSaveCredentials}
-                        disabled={isSavingCredentials || !draftRepo || !draftToken}
+                        disabled={isSavingCredentials || !draftRepo}
                         class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white text-sm font-medium transition"
                     >
                         {isSavingCredentials ? "Saving…" : "Save Credentials"}

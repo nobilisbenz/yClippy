@@ -23,6 +23,7 @@ class AppState {
         clipboardTemplate: `<iframe src="https://www.youtube.com/embed/{id}?start={start}&end={end}" height="360" width="100%" seamless="seamless" frameborder="0" allowfullscreen></iframe>`,
         githubTokenPresent: false,
         githubRepo: "",
+        vaultPath: "",
         lastSyncAt: null as number | null,
     });
 
@@ -194,7 +195,7 @@ class AppState {
         history.back();
     }
 
-    async triggerSync(): Promise<{ success: boolean; error?: string }> {
+    async triggerSync(): Promise<{ success: boolean; error?: string; detail?: string }> {
         if (!this.settings.githubTokenPresent || !this.settings.githubRepo) {
             const message = "GitHub Token and Repo URL are required";
             this.syncStatus = "error";
@@ -207,14 +208,17 @@ class AppState {
 
         try {
             const { invoke } = await import("@tauri-apps/api/core");
-            await invoke("start_github_sync");
+            // The engine reports what it actually did — how many changes came
+            // from where — which is the difference between "it worked" and
+            // knowing your other device's edits arrived.
+            const detail = await invoke<string>("start_github_sync");
             await this.refreshAll();
             this.updateSettings({ lastSyncAt: Date.now() });
             this.syncStatus = "success";
             setTimeout(() => {
                 if (this.syncStatus === "success") this.syncStatus = "idle";
             }, 3000);
-            return { success: true };
+            return { success: true, detail };
         } catch (e: any) {
             console.error(e);
             const errorStr = e.toString ? e.toString() : String(e);
@@ -227,24 +231,31 @@ class AppState {
     async refreshGithubConfig(): Promise<void> {
         try {
             const { invoke } = await import("@tauri-apps/api/core");
-            const cfg = await invoke<{ github_repo: string; token_present: boolean }>(
-                "get_github_config",
-            );
+            const cfg = await invoke<{
+                github_repo: string;
+                token_present: boolean;
+                vault_path: string;
+            }>("get_github_config");
             this.updateSettings({
                 githubRepo: cfg.github_repo || "",
                 githubTokenPresent: cfg.token_present,
+                vaultPath: cfg.vault_path || "",
             });
         } catch (e) {
             console.error("Failed to load GitHub config:", e);
         }
     }
 
+    /// Cleared by the player once it has actually seeked, so a later plain
+    /// open of the same video starts from its own last_position.
+    consumeSeek() {
+        this.seekToTime = undefined;
+    }
+
     async playVideoById(videoId: string, atSeconds?: number) {
         const found = this.videos.find((v) => v.id === videoId);
         if (found) {
-            if (atSeconds !== undefined) {
-                this.seekToTime = atSeconds;
-            }
+            this.seekToTime = atSeconds;
             this.openVideo(found);
             return true;
         }

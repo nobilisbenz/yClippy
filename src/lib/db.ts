@@ -166,6 +166,7 @@ export async function fetchVideoOembed(videoId: string): Promise<VideoOembed | n
 export interface GithubConfigPublic {
     github_repo: string;
     token_present: boolean;
+    vault_path: string;
 }
 
 export async function getGithubConfig(): Promise<GithubConfigPublic> {
@@ -175,18 +176,50 @@ export async function getGithubConfig(): Promise<GithubConfigPublic> {
 export async function setGithubConfig(
     githubRepo: string,
     githubToken: string | null,
+    vaultPath?: string | null,
 ): Promise<void> {
-    await invoke("set_github_config", { githubRepo, githubToken });
+    await invoke("set_github_config", { githubRepo, githubToken, vaultPath });
 }
 
 export async function clearGithubToken(): Promise<void> {
     await invoke("clear_github_token");
 }
 
-export async function pullRemote(): Promise<number> {
-    return await invoke<number>("pull_remote");
+// Pulling, merging, pushing, and compaction are one operation now — splitting
+// them let a caller compact before it had pulled, which dropped changes that
+// had never been applied. `start_github_sync` is the whole cycle.
+
+export interface PlayRequest {
+    url: string;
+    video_id: string;
+    at_seconds: number | null;
+    end_seconds: number | null;
+    folder: string | null;
+    title: string | null;
+    open: boolean;
 }
 
-export async function compactLibrary(): Promise<void> {
-    await invoke("compact_library");
+/// Drains a `yclippy play` that arrived before this webview was listening.
+export async function takePendingPlay(): Promise<PlayRequest | null> {
+    return await invoke<PlayRequest | null>("take_pending_play");
+}
+
+export interface PickerItem {
+    kind: "video" | "clip";
+    video_id: string;
+    url: string;
+    title: string;
+    thumbnail_url: string;
+    start_seconds: number;
+    end_seconds: number;
+    last_position: number;
+    clip_uid: string | null;
+    clip_count: number;
+}
+
+export async function listForPicker(
+    query?: string,
+    limit?: number,
+): Promise<PickerItem[]> {
+    return await invoke<PickerItem[]>("list_videos_for_picker", { query, limit });
 }

@@ -100,12 +100,14 @@
 
     function runItem(item: Item, withCtrlEnter: boolean) {
         if (item.kind === "video") {
+            appState.consumeSeek();
             appState.openVideo(item.video);
         } else if (item.kind === "folder") {
             appState.openFolder([item.folder.id!]);
         } else if (item.kind === "clip") {
-            appState.openVideo(item.video);
+            // Set before opening: the player captures it at init.
             appState.seekToTime = item.clip.start_time;
+            appState.openVideo(item.video);
         } else if (item.kind === "action") {
             item.run();
         }

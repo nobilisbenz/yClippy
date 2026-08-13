@@ -9,12 +9,20 @@ import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.Toast
+import org.json.JSONObject
 
 class MainActivity : TauriActivity() {
 
     private var webView: WebView? = null
-    private val pendingSharedVideoIds = mutableListOf<String>()
+    private val pendingIntents = mutableListOf<VideoIntent>()
     private var webViewReady = false
+
+    /** A video id plus what to do with it: play at a second, or offer to import. */
+    private data class VideoIntent(
+        val videoId: String,
+        val startSeconds: Int = 0,
+        val play: Boolean = false,
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,12 +45,41 @@ class MainActivity : TauriActivity() {
     private fun handleViewIntent(intent: Intent) {
         val data = intent.data ?: return
         if (data.scheme == "yclippy") {
-            val videoId = data.getQueryParameter("v") ?: return
-            deliverSharedVideo(videoId)
+            // Anything in this URI came from another app on the device, so the
+            // id is validated to the YouTube shape before it goes anywhere near
+            // the webview, and the timestamp is parsed as an integer.
+            val raw = data.getQueryParameter("v")
+            val videoId = raw?.takeIf { VIDEO_ID.matches(it) } ?: run {
+                Log.w(TAG, "Rejected deep link with a malformed video id")
+                Toast.makeText(this, "That link isn't a YouTube video", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val start = parseStartSeconds(data.getQueryParameter("t"))
+            deliver(VideoIntent(videoId, start, play = true))
             return
         }
-        val videoId = extractYouTubeId(data.toString()) ?: return
-        deliverSharedVideo(videoId)
+
+        val url = data.toString()
+        val videoId = extractYouTubeId(url) ?: run {
+            Log.w(TAG, "VIEW intent has no YouTube video id: $url")
+            Toast.makeText(this, "No video in that link", Toast.LENGTH_SHORT).show()
+            return
+        }
+        deliver(VideoIntent(videoId, parseStartSeconds(data.getQueryParameter("t")), play = true))
+    }
+
+    /** Accepts `90`, `90s`, `6m54s`, `1h2m3s` — the shapes YouTube itself emits. */
+    private fun parseStartSeconds(raw: String?): Int {
+        val value = raw?.trim().orEmpty()
+        if (value.isEmpty()) return 0
+        value.toIntOrNull()?.let { return maxOf(0, it) }
+
+        val match = Regex("^(?:(\\d+)h)?(?:(\\d+)m)?(?:(\\d+)s)?$").find(value) ?: return 0
+        val (h, m, s) = match.destructured
+        val total = (h.toIntOrNull() ?: 0) * 3600 +
+            (m.toIntOrNull() ?: 0) * 60 +
+            (s.toIntOrNull() ?: 0)
+        return maxOf(0, total)
     }
 
     override fun onWebViewCreate(webView: WebView) {
@@ -54,25 +91,55 @@ class MainActivity : TauriActivity() {
 
     private fun handleShareIntent(intent: Intent?) {
         if (intent?.action != Intent.ACTION_SEND) return
-        if (intent.type != "text/plain") return
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
+        // The manifest advertises text/*; accepting only text/plain here made
+        // yClippy appear in share sheets and then do nothing.
+        val type = intent.type.orEmpty()
+        if (!type.startsWith("text/")) return
+
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+            ?: intent.getStringExtra(Intent.EXTRA_TITLE)
+            ?: intent.data?.toString()
+            ?: return
         val videoId = extractYouTubeId(text) ?: run {
             Log.w(TAG, "Shared text has no YouTube ID: $text")
             Toast.makeText(this, "Shared text isn't a YouTube link", Toast.LENGTH_SHORT).show()
             return
         }
         Log.d(TAG, "Received shared video: $videoId")
-        Toast.makeText(this, "Importing video: $videoId", Toast.LENGTH_SHORT).show()
-        deliverSharedVideo(videoId)
+        deliver(VideoIntent(videoId, startSeconds = timestampIn(text)))
     }
 
-    private fun deliverSharedVideo(videoId: String) {
-        val js = "if (window.__yclippyOnSharedVideo) { window.__yclippyOnSharedVideo('$videoId'); } else { console.warn('Svelte app not ready'); }"
+    /** Pulls `?t=` / `&t=` out of a shared URL so a shared moment stays a moment. */
+    private fun timestampIn(text: String): Int {
+        val match = Regex("[?&]t=([0-9hms]+)").find(text) ?: return 0
+        return parseStartSeconds(match.groupValues.getOrNull(1))
+    }
+
+    private fun deliver(intent: VideoIntent) {
         if (webViewReady) {
-            webView?.evaluateJavascript(js, null)
+            dispatch(intent)
         } else {
-            pendingSharedVideoIds.add(videoId)
+            pendingIntents.add(intent)
         }
+    }
+
+    private fun dispatch(intent: VideoIntent) {
+        // Values are JSON-encoded rather than interpolated: the deep-link path
+        // carries text from other apps on the device.
+        val payload = JSONObject()
+            .put("videoId", intent.videoId)
+            .put("startSeconds", intent.startSeconds)
+            .put("play", intent.play)
+            .toString()
+        val js = """
+            (function () {
+              var p = $payload;
+              if (p.play && window.__yclippyOnPlay) { window.__yclippyOnPlay(p); }
+              else if (window.__yclippyOnSharedVideo) { window.__yclippyOnSharedVideo(p.videoId); }
+              else { console.warn('yClippy frontend not ready'); }
+            })();
+        """.trimIndent()
+        webView?.evaluateJavascript(js, null)
     }
 
     private fun extractYouTubeId(input: String): String? {
@@ -135,19 +202,15 @@ class MainActivity : TauriActivity() {
     fun onSvelteAppReady() {
         runOnUiThread {
             webViewReady = true
-            Log.d(TAG, "Svelte app ready, draining ${pendingSharedVideoIds.size} pending shared videos")
-            pendingSharedVideoIds.forEach { id ->
-                webView?.evaluateJavascript(
-                    "if (window.__yclippyOnSharedVideo) { window.__yclippyOnSharedVideo('$id'); }",
-                    null
-                )
-            }
-            pendingSharedVideoIds.clear()
+            Log.d(TAG, "Frontend ready, draining ${pendingIntents.size} pending intents")
+            pendingIntents.forEach { dispatch(it) }
+            pendingIntents.clear()
         }
     }
 
     companion object {
         private const val TAG = "MainActivity"
+        private val VIDEO_ID = Regex("^[a-zA-Z0-9_-]{11}$")
     }
 }
 

@@ -77,13 +77,17 @@
   });
 </script>
 
-<TitleBar />
-
 <div
-  class="flex w-full bg-black text-white font-sans overflow-hidden select-none"
+  class="flex flex-col w-full bg-[color:var(--bg)] text-[color:var(--text)] font-sans overflow-hidden select-none"
   style="height: 100dvh; padding-top: var(--safe-top); padding-bottom: var(--safe-bottom); padding-left: var(--safe-left); padding-right: var(--safe-right);"
 >
-  <LibraryAndPlayer />
+  <!-- In flow, not fixed: as an overlay it covered the top 40px of whatever
+       was underneath it. -->
+  <TitleBar onSearch={() => (isCommandPaletteOpen = true)} />
+
+  <div class="flex-1 min-h-0 flex w-full">
+    <LibraryAndPlayer />
+  </div>
 
   {#if appState.isAddVideoModalOpen}
     <AddVideoModal folderId={appState.addVideoFolderId} />
@@ -114,21 +118,29 @@
   {/if}
 </div>
 
-{#if appState.toast}
-  <Toast
-    key={appState.toast.id}
-    message={appState.toast.message}
-    kind={appState.toast.kind}
-    onClose={() => (appState.toast = null)}
-  />
-{/if}
+<!-- One stack, so a toast and an undo offer queue instead of overlapping. -->
+{#if appState.toast || appState.undoable}
+  <div
+    class="fixed left-1/2 -translate-x-1/2 z-[200] flex flex-col items-center gap-2 pointer-events-none [&>*]:pointer-events-auto"
+    style="bottom: calc(24px + var(--safe-bottom))"
+  >
+    {#if appState.toast}
+      <Toast
+        key={appState.toast.id}
+        message={appState.toast.message}
+        kind={appState.toast.kind}
+        onClose={() => (appState.toast = null)}
+      />
+    {/if}
 
-{#if appState.undoable}
-  <UndoToast
-    message={appState.undoable.message}
-    onUndo={() => appState.performUndo()}
-    onDismiss={() => appState.dismissUndo()}
-  />
+    {#if appState.undoable}
+      <UndoToast
+        message={appState.undoable.message}
+        onUndo={() => appState.performUndo()}
+        onDismiss={() => appState.dismissUndo()}
+      />
+    {/if}
+  </div>
 {/if}
 
 {#if isCommandPaletteOpen}

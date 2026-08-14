@@ -2,6 +2,8 @@
     import { appState } from "./state.svelte";
     import { onMount, tick } from "svelte";
     import type { Video, Clip, Folder } from "./db";
+    import Icon from "./Icon.svelte";
+    import { formatClock } from "./youtube.svelte";
 
     let { onClose }: { onClose: () => void } = $props();
 
@@ -98,7 +100,7 @@
         inputEl?.focus();
     });
 
-    function runItem(item: Item, withCtrlEnter: boolean) {
+    function runItem(item: Item) {
         if (item.kind === "video") {
             appState.consumeSeek();
             appState.openVideo(item.video);
@@ -127,9 +129,7 @@
         } else if (e.key === "Enter") {
             e.preventDefault();
             const item = items[selectedIndex];
-            if (item) {
-                runItem(item, e.ctrlKey || e.metaKey);
-            }
+            if (item) runItem(item);
         }
     }
 
@@ -142,13 +142,15 @@
 
     function hintFor(item: Item): string {
         if (item.kind === "video") {
-            return `${item.video.last_position > 0 ? `${Math.floor(item.video.last_position)}s · ` : ""}Video`;
+            return item.video.last_position > 0
+                ? `at ${formatClock(item.video.last_position)}`
+                : "video";
         }
         if (item.kind === "folder") return `${item.childCount} item${item.childCount === 1 ? "" : "s"}`;
         if (item.kind === "clip") {
-            return `${Math.floor(item.clip.start_time)}s–${Math.floor(item.clip.end_time)}s · Clip`;
+            return `${formatClock(item.clip.start_time)} – ${formatClock(item.clip.end_time)}`;
         }
-        return "Action";
+        return "action";
     }
 </script>
 
@@ -166,42 +168,55 @@
         aria-modal="true"
         tabindex="-1"
     >
-        <input
-            bind:this={inputEl}
-            bind:value={query}
-            type="text"
-            placeholder="Search videos, folders, clips, or run a command…"
-            class="w-full bg-transparent text-white text-lg px-4 py-4 outline-none border-b border-[color:var(--border)]"
-        />
+        <div class="flex items-center gap-3 px-4 border-b border-[color:var(--border)]">
+            <span class="text-[color:var(--text-faint)] shrink-0">
+                <Icon name="search" size={16} />
+            </span>
+            <input
+                bind:this={inputEl}
+                bind:value={query}
+                type="text"
+                placeholder="Search videos, folders and clips, or run a command…"
+                class="flex-1 min-w-0 bg-transparent text-[color:var(--text)] text-base py-4 outline-none placeholder:text-[color:var(--text-faint)]"
+            />
+        </div>
 
         <div class="max-h-[50vh] overflow-y-auto">
             {#if items.length === 0}
-                <div class="px-4 py-8 text-center text-zinc-500 text-sm">
+                <div class="px-4 py-8 text-center text-[color:var(--text-faint)] text-sm">
                     No matches
                 </div>
             {:else}
                 {#each items as item, i (i + "-" + labelFor(item))}
                     <button
                         type="button"
-                        onclick={() => runItem(item, false)}
+                        onclick={() => runItem(item)}
                         onmouseenter={() => (selectedIndex = i)}
-                        class="w-full flex items-center justify-between gap-3 px-4 py-2 text-left text-sm transition-colors {i === selectedIndex
+                        class="w-full flex items-center justify-between gap-3 px-4 py-2 text-left text-sm transition-colors {i ===
+                        selectedIndex
                             ? 'bg-[color:var(--accent)] text-white'
-                            : 'text-zinc-200 hover:bg-[color:var(--surface-hi)]'}"
+                            : 'text-[color:var(--text-dim)] hover:bg-[color:var(--surface-hi)]'}"
                     >
-                        <div class="flex items-center gap-2 truncate">
-                            {#if item.kind === "folder"}
-                                <svg class="size-4 opacity-70" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-                            {:else if item.kind === "clip"}
-                                <svg class="size-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                            {:else if item.kind === "video"}
-                                <svg class="size-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
-                            {:else}
-                                <svg class="size-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-                            {/if}
+                        <div class="flex items-center gap-2.5 truncate">
+                            <span class="opacity-80 shrink-0">
+                                <Icon
+                                    name={item.kind === "folder"
+                                        ? "folder"
+                                        : item.kind === "clip"
+                                          ? "scissors"
+                                          : item.kind === "video"
+                                            ? "video"
+                                            : "check"}
+                                    size={15}
+                                />
+                            </span>
                             <span class="truncate">{labelFor(item)}</span>
                         </div>
-                        <span class="text-xs {i === selectedIndex ? 'text-white/80' : 'text-zinc-500'}">
+                        <span
+                            class="text-[11px] t-num shrink-0 {i === selectedIndex
+                                ? 'text-white/80'
+                                : 'text-[color:var(--text-faint)]'}"
+                        >
                             {hintFor(item)}
                         </span>
                     </button>
@@ -209,9 +224,14 @@
             {/if}
         </div>
 
-        <div class="px-4 py-2 border-t border-[color:var(--border)] text-xs text-zinc-500 flex justify-between">
-            <span>↑↓ navigate · Enter open · Ctrl+Enter play clip</span>
-            <span>Esc close</span>
+        <div
+            class="px-4 py-2 border-t border-[color:var(--border)] text-[11px] text-[color:var(--text-faint)] flex justify-between items-center gap-2"
+        >
+            <span class="flex items-center gap-1.5">
+                <kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd> move
+                <kbd class="kbd">↵</kbd> open
+            </span>
+            <span class="flex items-center gap-1.5"><kbd class="kbd">Esc</kbd> close</span>
         </div>
     </div>
 </div>

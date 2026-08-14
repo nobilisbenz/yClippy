@@ -10,11 +10,19 @@ export class YouTubeController {
     player = $state<any>(null);
     currentTime = $state(0);
     duration = $state(0);
+    /// 0–1. Drawn behind the playhead so a stall reads as "still buffering"
+    /// rather than "frozen".
+    loaded = $state(0);
     /// True whenever the video is not actively playing — including ended,
     /// which is the case the two old players disagreed about.
     isPaused = $state(true);
     isReady = $state(false);
     hasEnded = $state(false);
+    /// Set when the stage cannot show the video — the API script failed, or
+    /// YouTube refused the embed. Without this a failure is a black rectangle
+    /// with working buttons, which is indistinguishable from a video that has
+    /// not started.
+    error = $state<string | null>(null);
 
     /// The pending clip, before it is named and saved. Keeping it as an object
     /// rather than two loose numbers is what lets the track draw it and lets
@@ -25,10 +33,20 @@ export class YouTubeController {
     private containerId = `yt-${Math.random().toString(36).slice(2, 9)}`;
     private ticker: number | undefined;
     private video: Video | null = null;
+    private lastStartAt: number | undefined;
 
     get elementId() {
         return this.containerId;
     }
+
+    /// The privacy-enhanced host serves the *player*, but it does not serve
+    /// the loader: `youtube-nocookie.com/iframe_api` is a 404 HTML page, which
+    /// a `nosniff` webview refuses to execute, so `window.YT` never appears
+    /// and every mount hangs on a black stage. The script comes from
+    /// youtube.com; `host` below still puts the iframe itself on nocookie.
+    private static readonly API_SRC = "https://www.youtube.com/iframe_api";
+    private static readonly PLAYER_HOST = "https://www.youtube-nocookie.com";
+    private static readonly API_TIMEOUT_MS = 15_000;
 
     /// Loads the iframe API once per document, and never leaves a global
     /// callback pointing at a destroyed component.
@@ -39,25 +57,103 @@ export class YouTubeController {
         }
         if (YouTubeController.apiReady) return YouTubeController.apiReady;
 
-        YouTubeController.apiReady = new Promise<void>((resolve) => {
+        YouTubeController.apiReady = new Promise<void>((resolve, reject) => {
+            let settled = false;
+            // A rejected load must not be cached, or the retry button would
+            // replay the same failure without ever asking the network again.
+            const fail = (reason: string) => {
+                if (settled) return;
+                settled = true;
+                YouTubeController.apiReady = null;
+                document.querySelector("script[data-yt-api]")?.remove();
+                reject(new Error(reason));
+            };
+            const done = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve();
+            };
+
+            const timer = setTimeout(
+                () => fail("Timed out loading the YouTube player."),
+                YouTubeController.API_TIMEOUT_MS,
+            );
+
             const previous = window.onYouTubeIframeAPIReady;
             window.onYouTubeIframeAPIReady = () => {
                 previous?.();
-                resolve();
+                done();
             };
+
             if (!document.querySelector("script[data-yt-api]")) {
                 const tag = document.createElement("script");
-                tag.src = "https://www.youtube.com/iframe_api";
+                tag.src = YouTubeController.API_SRC;
+                tag.async = true;
                 tag.setAttribute("data-yt-api", "true");
+                tag.onerror = () => {
+                    clearTimeout(timer);
+                    fail("Could not reach YouTube. Check your connection.");
+                };
                 document.head.appendChild(tag);
             }
         });
         return YouTubeController.apiReady;
     }
 
+    /// Whether this webview can decode what YouTube serves.
+    ///
+    /// On Linux the webview is WebKitGTK, which decodes through GStreamer, and
+    /// a stock Ubuntu install ships neither H.264 nor AAC. YouTube then hands
+    /// back its own "your browser can't play this video" card *inside* the
+    /// iframe, where the API reports nothing and the app looks broken. Asking
+    /// MediaSource up front turns that into a sentence naming the fix.
+    static codecSupport(): { ok: boolean; video: boolean; audio: boolean } {
+        const MS = typeof window === "undefined" ? null : (window as any).MediaSource;
+        if (!MS?.isTypeSupported) return { ok: true, video: true, audio: true };
+        const can = (type: string) => {
+            try {
+                return MS.isTypeSupported(type);
+            } catch {
+                return false;
+            }
+        };
+        const video =
+            can('video/mp4; codecs="avc1.42E01E"') || can('video/webm; codecs="vp9"');
+        const audio = can('audio/mp4; codecs="mp4a.40.2"') || can('audio/webm; codecs="opus"');
+        return { ok: video && audio, video, audio };
+    }
+
+    /// YouTube reports refusals as numbers. Say what they mean, and offer the
+    /// only thing that actually works for an un-embeddable video: open it out.
+    private static describeError(code: number): string {
+        switch (code) {
+            case 2:
+                return "YouTube rejected this video id.";
+            case 5:
+                return "This video cannot be played in an embedded player.";
+            case 100:
+                return "This video is private or has been removed.";
+            case 101:
+            case 150:
+                return "The owner does not allow this video to be embedded.";
+            default:
+                return "YouTube could not play this video.";
+        }
+    }
+
     async mount(video: Video, startAt?: number) {
         this.video = video;
-        await YouTubeController.loadApi();
+        this.error = null;
+        this.lastStartAt = startAt;
+
+        try {
+            await YouTubeController.loadApi();
+        } catch (e) {
+            if (this.video !== video) return;
+            this.error = e instanceof Error ? e.message : String(e);
+            return;
+        }
         // The component may have unmounted while the script loaded.
         if (this.video !== video) return;
 
@@ -71,10 +167,19 @@ export class YouTubeController {
             // Re-enabled: switching these off removed YouTube's own fullscreen
             // and keyboard control without replacing either.
             fs: 1,
+            enablejsapi: 1,
         };
+        // `origin` tells YouTube which document to post messages back to. The
+        // bundled app is served from a custom scheme, and handing YouTube a
+        // `tauri://` origin it cannot honour breaks the handshake it is meant
+        // to secure — so it is sent only when the page is genuinely on http(s),
+        // which is the dev server.
+        const origin = typeof window !== "undefined" ? window.location.origin : "";
+        if (/^https?:$/.test(window.location.protocol)) playerVars.origin = origin;
         if (video.end_time > 0) playerVars.end = video.end_time;
 
         this.player = new (window as any).YT.Player(this.containerId, {
+            host: YouTubeController.PLAYER_HOST,
             height: "100%",
             width: "100%",
             videoId: video.id,
@@ -82,6 +187,7 @@ export class YouTubeController {
             events: {
                 onReady: (event: any) => {
                     this.isReady = true;
+                    this.error = null;
                     if (startAt !== undefined) event.target?.seekTo?.(startAt, true);
                     this.sample();
                 },
@@ -92,10 +198,39 @@ export class YouTubeController {
                     this.hasEnded = event.data === 0;
                     this.sample();
                 },
+                onError: (event: any) => {
+                    this.error = YouTubeController.describeError(Number(event?.data));
+                },
             },
         });
 
         this.ticker = setInterval(() => this.sample(), 500) as unknown as number;
+    }
+
+    /// Tears the current attempt down and mounts again from scratch. The
+    /// watch position is not written here: a failed mount never had one.
+    async retry() {
+        const video = this.video;
+        if (!video) return;
+        if (this.ticker !== undefined) {
+            clearInterval(this.ticker);
+            this.ticker = undefined;
+        }
+        try {
+            this.player?.destroy?.();
+        } catch {
+            // A player that failed to build has nothing to tear down.
+        }
+        this.player = null;
+        this.isReady = false;
+        this.error = null;
+        await this.mount(video, this.lastStartAt);
+    }
+
+    get watchUrl(): string {
+        if (!this.video) return "https://www.youtube.com";
+        const at = Math.floor(this.currentTime);
+        return `https://www.youtube.com/watch?v=${this.video.id}${at > 0 ? `&t=${at}s` : ""}`;
     }
 
     private sample() {
@@ -108,6 +243,10 @@ export class YouTubeController {
         if (typeof p.getDuration === "function") {
             const d = p.getDuration();
             if (typeof d === "number" && d > 0) this.duration = d;
+        }
+        if (typeof p.getVideoLoadedFraction === "function") {
+            const f = p.getVideoLoadedFraction();
+            if (typeof f === "number" && !Number.isNaN(f)) this.loaded = f;
         }
     }
 
@@ -191,6 +330,7 @@ export class YouTubeController {
         }
         this.player = null;
         this.isReady = false;
+        this.error = null;
 
         if (video?.id && position > 0) {
             try {

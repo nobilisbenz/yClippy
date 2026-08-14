@@ -1,6 +1,8 @@
 <script lang="ts">
     import { appState } from "./state.svelte";
-    import { saveVideo, fetchVideoOembed, type Video } from "./db";
+    import { saveVideo, fetchVideoOembed, getVideos, type Video } from "./db";
+    import Modal from "./Modal.svelte";
+    import Thumbnail from "./Thumbnail.svelte";
 
     let { folderId = null } = $props<{ folderId?: number | null }>();
 
@@ -36,46 +38,64 @@
         return null;
     }
 
+    /// The id is recognised as you type, so a bad paste is obvious before you
+    /// press the button and the thumbnail confirms you got the right video.
+    const previewId = $derived(extractVideoId(url));
+
+    const folderLabel = $derived(
+        folderId === null
+            ? "Library"
+            : (appState.folders.find((f) => f.id === folderId)?.name ?? "Library"),
+    );
+
+    /// Accepts `1:23`, `1:02:03` and plain seconds — a timestamp copied off
+    /// YouTube is never a bare number.
+    function parseTime(input: string): number {
+        const trimmed = input.trim();
+        if (!trimmed) return 0;
+        if (trimmed.includes(":")) {
+            const parts = trimmed.split(":").map((p) => parseFloat(p) || 0);
+            return Math.floor(parts.reduce((total, part) => total * 60 + part, 0));
+        }
+        return Math.floor(parseFloat(trimmed) || 0);
+    }
+
     async function handleSubmit() {
         loading = true;
         error = "";
         try {
             const videoId = extractVideoId(url);
-            if (!videoId) throw new Error("Invalid YouTube URL or ID");
+            if (!videoId) throw new Error("That is not a YouTube link or video id.");
 
+            const existing = (await getVideos()).find((v) => v.id === videoId);
             let title = customTitle.trim();
-
             if (!title) {
                 try {
                     const oembed = await fetchVideoOembed(videoId);
-                    if (oembed?.title) {
-                        title = oembed.title;
-                    } else {
-                        title = `Video ${videoId}`;
-                    }
+                    title = oembed?.title || existing?.title || `Video ${videoId}`;
                 } catch {
-                    title = `Video ${videoId}`;
+                    title = existing?.title || `Video ${videoId}`;
                 }
             }
 
-            const start = Math.floor(parseFloat(startTimeStr) || 0);
-            const end = Math.floor(parseFloat(endTimeStr) || 0);
-
+            // Re-adding a video you already have keeps its watch position and
+            // its clips instead of resetting them to zero.
             const video: Video = {
                 id: videoId,
-                title: title,
-                thumbnail_url: "",
-                duration: 0,
-                last_position: 0,
-                created_at: Date.now(),
-                folder_id: folderId,
-                start_time: start,
-                end_time: end,
-                sort_order: 0,
+                title,
+                thumbnail_url: existing?.thumbnail_url ?? "",
+                duration: existing?.duration ?? 0,
+                last_position: existing?.last_position ?? 0,
+                created_at: existing?.created_at ?? Date.now(),
+                folder_id: existing ? existing.folder_id : folderId,
+                start_time: parseTime(startTimeStr) || existing?.start_time || 0,
+                end_time: parseTime(endTimeStr) || existing?.end_time || 0,
+                sort_order: existing?.sort_order ?? 0,
             };
 
             await saveVideo(video);
             await appState.refreshVideos();
+            appState.showToast(existing ? "Video updated" : `Added “${title}”`, "success");
             close();
         } catch (e: any) {
             error = e.message || String(e);
@@ -90,99 +110,84 @@
         customTitle = "";
         startTimeStr = "";
         endTimeStr = "";
+        error = "";
     }
 </script>
 
-<div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
->
-    <div
-        class="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-2xl"
+<Modal title="Add a video" onClose={close}>
+    <form
+        id="add-video-form"
+        onsubmit={(e) => {
+            e.preventDefault();
+            handleSubmit();
+        }}
+        class="flex flex-col gap-4"
     >
-        <h2 class="text-xl font-bold text-white mb-4">Add Video</h2>
+        <div>
+            <label class="label" for="url">YouTube link or id</label>
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+                type="text"
+                id="url"
+                autofocus
+                bind:value={url}
+                placeholder="https://www.youtube.com/watch?v=…"
+                class="field"
+            />
+        </div>
 
-        <form
-            onsubmit={(e) => {
-                e.preventDefault();
-                handleSubmit();
-            }}
+        {#if previewId}
+            <div class="flex items-center gap-3 p-2 rounded-[6px] bg-[color:var(--bg)] border border-[color:var(--border)]">
+                <Thumbnail
+                    videoId={previewId}
+                    alt=""
+                    className="w-24 h-[54px] object-cover rounded-[4px] bg-black shrink-0"
+                />
+                <div class="min-w-0 text-xs">
+                    <div class="t-num text-[color:var(--text-dim)] truncate">{previewId}</div>
+                    <div class="text-[color:var(--text-faint)] mt-0.5">
+                        Saving to <span class="text-[color:var(--text-dim)]">{folderLabel}</span>
+                    </div>
+                </div>
+            </div>
+        {/if}
+
+        <div>
+            <label class="label" for="title">Title <span class="text-[color:var(--text-faint)]">(optional)</span></label>
+            <input
+                type="text"
+                id="title"
+                bind:value={customTitle}
+                placeholder="Taken from YouTube if left blank"
+                class="field"
+            />
+        </div>
+
+        <div class="flex gap-3">
+            <div class="flex-1">
+                <label class="label" for="start">Start</label>
+                <input type="text" id="start" bind:value={startTimeStr} placeholder="0:00" class="field t-num" />
+            </div>
+            <div class="flex-1">
+                <label class="label" for="end">End</label>
+                <input type="text" id="end" bind:value={endTimeStr} placeholder="end of video" class="field t-num" />
+            </div>
+        </div>
+
+        {#if error}
+            <p class="text-sm" style="color: var(--danger)">{error}</p>
+        {/if}
+    </form>
+
+    {#snippet footer()}
+        <button type="button" class="btn btn-ghost" onclick={close}>Cancel</button>
+        <button
+            type="submit"
+            form="add-video-form"
+            class="btn btn-primary"
+            disabled={loading || !url.trim()}
         >
-            <div class="mb-4">
-                <label
-                    class="block text-sm font-medium text-zinc-400 mb-1"
-                    for="url">YouTube URL</label
-                >
-                <input
-                    type="text"
-                    id="url"
-                    bind:value={url}
-                    placeholder="https://youtube.com/watch?v=..."
-                    class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-600 transition"
-                />
-            </div>
-
-            <div class="mb-4">
-                <label
-                    class="block text-sm font-medium text-zinc-400 mb-1"
-                    for="title">Title (Optional)</label
-                >
-                <input
-                    type="text"
-                    id="title"
-                    bind:value={customTitle}
-                    placeholder="Custom Title"
-                    class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-600 transition"
-                />
-            </div>
-
-            <div class="flex gap-4 mb-4">
-                <div class="flex-1">
-                    <label
-                        class="block text-sm font-medium text-zinc-400 mb-1"
-                        for="start">Start (Optional)</label
-                    >
-                    <input
-                        type="number"
-                        id="start"
-                        bind:value={startTimeStr}
-                        placeholder="0"
-                        class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-600 transition"
-                    />
-                </div>
-                <div class="flex-1">
-                    <label
-                        class="block text-sm font-medium text-zinc-400 mb-1"
-                        for="end">End (Optional)</label
-                    >
-                    <input
-                        type="number"
-                        id="end"
-                        bind:value={endTimeStr}
-                        placeholder="0"
-                        class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-600 transition"
-                    />
-                </div>
-            </div>
-
-            {#if error}
-                <p class="text-red-500 text-sm mb-4">{error}</p>
-            {/if}
-
-            <div class="flex justify-end gap-3">
-                <button
-                    type="button"
-                    onclick={close}
-                    class="px-4 py-2 rounded-lg hover:bg-zinc-800 text-zinc-300 transition"
-                    >Cancel</button
-                >
-                <button
-                    type="submit"
-                    disabled={loading}
-                    class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white font-medium disabled:opacity-50 transition"
-                >
-                    {loading ? "Adding..." : "Add Video"}
-                </button>
-            </div>
-        </form>
-    </div>
-</div>
+            {loading ? "Adding…" : "Add video"}
+        </button>
+    {/snippet}
+</Modal>

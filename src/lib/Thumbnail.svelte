@@ -31,7 +31,7 @@
 
 {#if failed}
     <div
-        class="flex items-center justify-center bg-zinc-800 text-zinc-600 text-xs {className}"
+        class="flex items-center justify-center bg-[color:var(--surface-hi)] text-[color:var(--text-faint)] text-xs {className}"
         aria-label="No thumbnail"
     >
         <svg class="size-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">

@@ -1,43 +1,51 @@
 <script lang="ts">
+    /// Destructive actions are undoable rather than confirmed: the schema
+    /// already soft-deletes, so the cheap thing to offer is the way back.
     let { message, onUndo, onDismiss } = $props<{
         message: string;
         onUndo: () => void;
         onDismiss: () => void;
     }>();
 
-    let remaining = $state(5);
+    const TOTAL_MS = 5000;
+    let remaining = $state(TOTAL_MS);
     let interval: number | undefined;
 
     $effect(() => {
         const start = Date.now();
-        const total = 5000;
         interval = setInterval(() => {
-            remaining = Math.max(0, Math.ceil((total - (Date.now() - start)) / 1000));
+            remaining = Math.max(0, TOTAL_MS - (Date.now() - start));
             if (remaining <= 0) {
                 clearInterval(interval);
                 onDismiss();
             }
-        }, 250) as unknown as number;
+        }, 100) as unknown as number;
         return () => clearInterval(interval);
     });
 
-    let widthPct = $derived((remaining / 5) * 100);
+    const widthPct = $derived((remaining / TOTAL_MS) * 100);
 </script>
 
 <div
     role="status"
-    class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[200] bg-zinc-900/95 text-white px-4 py-3 rounded-lg border border-zinc-700 shadow-xl flex items-center gap-3 max-w-md backdrop-blur-sm"
+    class="dialog relative overflow-hidden flex items-center gap-3 pl-3 pr-2 py-2 max-w-[min(28rem,90vw)] rounded-[10px]"
 >
-    <span class="text-sm">{message}</span>
+    <span class="text-[13px] text-[color:var(--text)] break-words">{message}</span>
     <button
+        class="btn btn-primary shrink-0"
+        style="height: 26px"
         onclick={() => {
             clearInterval(interval);
             onUndo();
         }}
-        class="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-xs font-medium transition-colors"
     >
         Undo
     </button>
-    <span class="text-xs text-zinc-500 t-num">{remaining}s</span>
-    <div class="absolute bottom-0 left-0 h-0.5 bg-blue-500 transition-all" style="width: {widthPct}%"></div>
+    <span class="text-[11px] t-num text-[color:var(--text-faint)] shrink-0 w-4 text-right">
+        {Math.ceil(remaining / 1000)}
+    </span>
+    <div
+        class="absolute bottom-0 left-0 h-0.5 bg-[color:var(--accent)]"
+        style="width: {widthPct}%; transition: width 100ms linear"
+    ></div>
 </div>

@@ -2,114 +2,85 @@
     import { appState } from "./state.svelte";
     import { deleteClip, renameClip, restoreClip, updateClipSortOrder, type Clip } from "./db";
     import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+    import { formatClock } from "./youtube.svelte";
+    import EditClipModal from "./EditClipModal.svelte";
+    import Icon from "./Icon.svelte";
 
-    let { videoId, seekTo } = $props<{
+    /// A clip is a named range, so the row leads with the range: one
+    /// tabular-nums timecode, then the name. Sorted by `sort_order`, which is
+    /// the order you chose, not the order you happened to record in.
+    let { videoId, seekTo, touch = false } = $props<{
         videoId: string;
         seekTo: (t: number) => void;
+        touch?: boolean;
     }>();
 
     let draggedClipId = $state<number | null>(null);
     let dragOverClipId = $state<number | null>(null);
+    let dragBefore = $state(true);
+    let editingClip = $state<Clip | null>(null);
+    let renamingClip = $state<Clip | null>(null);
+    let renamingTitle = $state("");
 
-    async function moveClipUp(clipId: number) {
-        const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
-        const index = clips.findIndex((c) => c.id === clipId);
-        if (index <= 0) return;
+    const clips = $derived(
+        [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order),
+    );
 
-        [clips[index - 1], clips[index]] = [clips[index], clips[index - 1]];
-
+    /// Renumbers the whole list on every move. Writing only the two swapped
+    /// rows leaves the rest with stale or duplicate orders.
+    async function commitOrder(ordered: Clip[]) {
         const updates: { id: number; sort_order: number }[] = [];
-        clips.forEach((clip, i) => {
-            if (clip.sort_order !== i) {
-                updates.push({ id: clip.id!, sort_order: i });
+        ordered.forEach((clip, index) => {
+            if (clip.sort_order !== index && clip.id !== undefined) {
+                updates.push({ id: clip.id, sort_order: index });
             }
         });
-        if (updates.length > 0) {
-            await updateClipSortOrder(updates);
-            await appState.refreshActiveClips();
-        }
+        if (updates.length === 0) return;
+        await updateClipSortOrder(updates);
+        await appState.refreshActiveClips();
     }
 
-    async function moveClipDown(clipId: number) {
-        const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
-        const index = clips.findIndex((c) => c.id === clipId);
-        if (index === -1 || index >= clips.length - 1) return;
-
-        [clips[index], clips[index + 1]] = [clips[index + 1], clips[index]];
-
-        const updates: { id: number; sort_order: number }[] = [];
-        clips.forEach((clip, i) => {
-            if (clip.sort_order !== i) {
-                updates.push({ id: clip.id!, sort_order: i });
-            }
-        });
-        if (updates.length > 0) {
-            await updateClipSortOrder(updates);
-            await appState.refreshActiveClips();
-        }
-    }
-
-    function getIsFirstClip(clipId: number): boolean {
-        const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
-        return clips[0]?.id === clipId;
-    }
-
-    function getIsLastClip(clipId: number): boolean {
-        const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
-        return clips[clips.length - 1]?.id === clipId;
+    async function move(clipId: number, delta: number) {
+        const ordered = [...clips];
+        const index = ordered.findIndex((c) => c.id === clipId);
+        const next = index + delta;
+        if (index === -1 || next < 0 || next >= ordered.length) return;
+        const [lifted] = ordered.splice(index, 1);
+        ordered.splice(next, 0, lifted);
+        await commitOrder(ordered);
     }
 
     async function handleClipReorder(draggedId: number, targetId: number, before: boolean) {
-        const clips = [...appState.activeClips].sort((a, b) => a.sort_order - b.sort_order);
-
-        const draggedIndex = clips.findIndex((c) => c.id === draggedId);
+        const ordered = [...clips];
+        const draggedIndex = ordered.findIndex((c) => c.id === draggedId);
         if (draggedIndex === -1) return;
-
-        const [draggedClip] = clips.splice(draggedIndex, 1);
-        let targetIndex = clips.findIndex((c) => c.id === targetId);
+        const [lifted] = ordered.splice(draggedIndex, 1);
+        // The target index is read *after* the lift, so "drop above" and "drop
+        // below" no longer differ by one depending on travel direction.
+        let targetIndex = ordered.findIndex((c) => c.id === targetId);
         if (targetIndex === -1) return;
-
-        if (!before) {
-            targetIndex += 1;
-        }
-        clips.splice(targetIndex, 0, draggedClip);
-
-        const updates: { id: number; sort_order: number }[] = [];
-        clips.forEach((clip, index) => {
-            if (clip.sort_order !== index) {
-                updates.push({ id: clip.id!, sort_order: index });
-            }
-        });
-
-        if (updates.length > 0) {
-            await updateClipSortOrder(updates);
-            await appState.refreshActiveClips();
-        }
+        if (!before) targetIndex += 1;
+        ordered.splice(targetIndex, 0, lifted);
+        await commitOrder(ordered);
     }
 
     function handleDragStart(e: DragEvent, clipId: number) {
         draggedClipId = clipId;
-        if (e.dataTransfer) {
-            e.dataTransfer.effectAllowed = "move";
-        }
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
     }
 
     function handleDragOver(e: DragEvent, clipId: number) {
         e.preventDefault();
-        if (e.dataTransfer) {
-            e.dataTransfer.dropEffect = "move";
-        }
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+        const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+        dragBefore = e.clientY - rect.top < rect.height / 2;
         dragOverClipId = clipId;
-    }
-
-    function handleDragLeave() {
-        dragOverClipId = null;
     }
 
     function handleDrop(e: DragEvent, targetId: number) {
         e.preventDefault();
         if (draggedClipId !== null && draggedClipId !== targetId) {
-            handleClipReorder(draggedClipId, targetId, true);
+            handleClipReorder(draggedClipId, targetId, dragBefore);
         }
         draggedClipId = null;
         dragOverClipId = null;
@@ -133,34 +104,29 @@
         });
     }
 
-    async function handleCopy(clip: any, e?: MouseEvent) {
+    async function handleCopy(clip: Clip, e?: MouseEvent) {
         e?.stopPropagation();
         try {
-            const code = renderTemplate(clip);
-            await writeText(code);
+            await writeText(renderTemplate(clip));
             appState.showToast("Copied to clipboard", "success");
         } catch (e) {
             console.error(e);
             appState.showToast(`Clipboard error: ${String(e)}`, "error");
         }
     }
+
     async function handleCopyAll() {
-        if (appState.activeClips.length === 0) return;
-
+        if (clips.length === 0) return;
         try {
-            const allClipsContent = appState.activeClips
-                .map((clip) => renderTemplate(clip))
-                .join("\n\n");
-
-            await writeText(allClipsContent);
-            appState.showToast("Copied all clips to clipboard", "success");
+            await writeText(clips.map((clip) => renderTemplate(clip)).join("\n\n"));
+            appState.showToast(`Copied ${clips.length} clips`, "success");
         } catch (e) {
             console.error(e);
             appState.showToast(`Clipboard error: ${String(e)}`, "error");
         }
     }
 
-    function renderTemplate(clip: any): string {
+    function renderTemplate(clip: Clip): string {
         const template = appState.settings.clipboardTemplate || "";
         const seconds = Math.floor(clip.start_time);
         const urlWithTs = `https://www.youtube.com/watch?v=${videoId}&t=${seconds}s`;
@@ -191,14 +157,6 @@
             .padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
     }
 
-    // Edit Modal State
-    import EditClipModal from "./EditClipModal.svelte";
-    let editingClip = $state<Clip | null>(null);
-
-    // Rename Modal State
-    let renamingClip = $state<Clip | null>(null);
-    let renamingTitle = $state("");
-
     function startRename(clip: Clip) {
         renamingClip = clip;
         renamingTitle = clip.title;
@@ -211,6 +169,16 @@
             await appState.refreshActiveClips();
         }
         renamingClip = null;
+    }
+
+    function contextItems(clip: Clip) {
+        return [
+            { label: "Play from here", action: () => seekTo(clip.start_time) },
+            { label: "Rename", action: () => startRename(clip) },
+            { label: "Edit range…", action: () => (editingClip = clip) },
+            { label: "Copy", action: () => handleCopy(clip) },
+            { label: "Delete", danger: true, action: () => handleDelete(clip.id!) },
+        ];
     }
 </script>
 
@@ -226,204 +194,163 @@
 {/if}
 
 {#if renamingClip}
-    <div
-        class="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
-    >
-        <div
-            class="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-2xl"
-        >
-            <h3 class="text-lg font-bold text-white mb-4">Rename Clip</h3>
-
-            <div class="mb-4">
-                <label
-                    class="block text-sm font-medium text-zinc-400 mb-1"
-                    for="rename-title">Title</label
-                >
-                <input
-                    bind:value={renamingTitle}
-                    type="text"
-                    id="rename-title"
-                    class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-600 transition"
-                    onkeydown={(e) => e.key === "Enter" && handleRenameSave()}
-                />
-            </div>
-
-            <div class="flex justify-end gap-3">
+    <div class="overlay z-[260] items-center justify-center p-4" role="presentation">
+        <div class="dialog w-full max-w-sm p-5">
+            <h3 class="text-base font-semibold mb-4">Rename clip</h3>
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+                bind:value={renamingTitle}
+                type="text"
+                autofocus
+                class="field"
+                onkeydown={(e) => {
+                    if (e.key === "Enter") handleRenameSave();
+                    if (e.key === "Escape") renamingClip = null;
+                }}
+            />
+            <div class="flex justify-end gap-2 mt-5">
+                <button class="btn" onclick={() => (renamingClip = null)}>Cancel</button>
                 <button
-                    onclick={() => (renamingClip = null)}
-                    class="px-4 py-2 rounded-lg hover:bg-zinc-800 text-zinc-300 transition"
-                    >Cancel</button
-                >
-                <button
+                    class="btn btn-primary"
                     onclick={handleRenameSave}
-                    disabled={!renamingTitle.trim()}
-                    class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white font-medium disabled:opacity-50 transition"
+                    disabled={!renamingTitle.trim()}>Rename</button
                 >
-                    Rename
-                </button>
             </div>
         </div>
     </div>
 {/if}
 
-<div class="flex flex-col gap-2 p-2 h-full">
-    {#if appState.activeClips.length === 0}
-        <div class="text-zinc-500 text-center py-8 text-sm w-full">
-            No clips yet
+<div class="flex flex-col h-full min-h-0">
+    {#if clips.length === 0}
+        <div class="empty">
+            <span class="text-[color:var(--text-faint)]"><Icon name="scissors" size={22} /></span>
+            <p>No clips yet</p>
+            <p class="text-[color:var(--text-faint)] leading-relaxed">
+                {#if touch}
+                    Tap <span class="text-[color:var(--text-dim)]">Mark in</span> at the
+                    start of a moment, then again at its end.
+                {:else}
+                    Press <kbd class="kbd">[</kbd> at the start of a moment and
+                    <kbd class="kbd">]</kbd> at its end, then <kbd class="kbd">↵</kbd> to
+                    name it.
+                {/if}
+            </p>
         </div>
     {:else}
-        <button
-            onclick={handleCopyAll}
-            class="w-full py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded text-sm font-medium transition-colors border border-zinc-700 flex flex-col items-center justify-center gap-1 shrink-0"
-        >
-            <span>Clip All</span>
-            <span class="text-xs opacity-60"
-                >({appState.activeClips.length})</span
-            >
-        </button>
-    {/if}
-
-    {#each appState.activeClips as clip (clip.id)}
-        <div
-            role="button"
-            tabindex="0"
-            draggable="true"
-            ondragstart={(e) => handleDragStart(e, clip.id!)}
-            ondragover={(e) => handleDragOver(e, clip.id!)}
-            ondragleave={handleDragLeave}
-            ondrop={(e) => handleDrop(e, clip.id!)}
-            ondragend={handleDragEnd}
-            onclick={() => seekTo(clip.start_time)}
-            oncontextmenu={(e) => {
-                e.preventDefault();
-                appState.contextMenu = {
-                    x: e.clientX,
-                    y: e.clientY,
-                    show: true,
-                    items: [
-                        {
-                            label: "Rename",
-                            action: () => startRename(clip),
-                        },
-                        {
-                            label: "Edit",
-                            action: () => (editingClip = clip),
-                        },
-                        {
-                            label: "Copy Embed",
-                            action: () => handleCopy(clip),
-                        },
-                        {
-                            label: "Delete",
-                            danger: true,
-                            action: () => handleDelete(clip.id!),
-                        },
-                    ],
-                };
-            }}
-            onkeydown={(e) => e.key === "Enter" && seekTo(clip.start_time)}
-            class="group w-full p-3 rounded-lg bg-zinc-900 border transition cursor-pointer flex flex-col gap-1 shrink-0 justify-between {draggedClipId === clip.id ? 'opacity-50 border-blue-500' : dragOverClipId === clip.id ? 'border-blue-400' : 'border-zinc-800 hover:border-zinc-700'}"
-        >
-            <div class="flex justify-between items-start">
-                <span
-                    class="font-medium text-sm text-zinc-200 line-clamp-2 md:line-clamp-none whitespace-normal"
-                    >{clip.title}</span
+        <div class="flex-1 min-h-0 overflow-y-auto scroll-thin">
+            {#each clips as clip, index (clip.id)}
+                <div
+                    role="button"
+                    tabindex="0"
+                    draggable={!touch}
+                    ondragstart={(e) => handleDragStart(e, clip.id!)}
+                    ondragover={(e) => handleDragOver(e, clip.id!)}
+                    ondragleave={() => (dragOverClipId = null)}
+                    ondrop={(e) => handleDrop(e, clip.id!)}
+                    ondragend={handleDragEnd}
+                    onclick={() => seekTo(clip.start_time)}
+                    onkeydown={(e) => e.key === "Enter" && seekTo(clip.start_time)}
+                    oncontextmenu={(e) => {
+                        e.preventDefault();
+                        appState.contextMenu = {
+                            x: e.clientX,
+                            y: e.clientY,
+                            show: true,
+                            items: contextItems(clip),
+                        };
+                    }}
+                    class="row items-start py-2 border-b border-[color:var(--border)] cursor-pointer
+                           {touch ? 'row-touch' : ''}
+                           {draggedClipId === clip.id ? 'opacity-40' : ''}
+                           {dragOverClipId === clip.id
+                        ? dragBefore
+                            ? 'border-t-2 border-t-[color:var(--accent)]'
+                            : 'border-b-2 border-b-[color:var(--accent)]'
+                        : ''}"
                 >
-                <div class="flex gap-1 shrink-0">
-                    <button
-                        onclick={(e) => {
-                            e.stopPropagation();
-                            editingClip = clip;
-                        }}
-                        class="p-1 hover:text-blue-400"
-                        title="Edit"
+                    <!-- The index doubles as the keyboard shortcut: 1–9 jump
+                         to clip N while the player has focus. -->
+                    <span
+                        class="w-4 shrink-0 text-[11px] t-num text-[color:var(--text-faint)] pt-0.5 text-right"
                     >
-                        <svg
-                            class="size-4"
-                            fill="none"
-                            viewBox="0 0 24 24"
-                            stroke="currentColor"
+                        {index + 1}
+                    </span>
+
+                    <div class="flex-1 min-w-0">
+                        <div
+                            class="text-sm text-[color:var(--text)] leading-snug break-words"
                         >
-                            <path
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                stroke-width="2"
-                                d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"
-                            />
-                        </svg>
-                    </button>
-                    <div class="flex flex-col">
-                        <button
-                            onclick={(e) => {
-                                e.stopPropagation();
-                                moveClipUp(clip.id!);
-                            }}
-                            class="p-1 hover:text-blue-400 disabled:opacity-30 disabled:cursor-not-allowed"
-                            title="Move Up"
-                            disabled={getIsFirstClip(clip.id!)}
+                            {clip.title}
+                        </div>
+                        <div
+                            class="mt-1 flex items-center gap-2 text-[11px] t-num text-[color:var(--text-faint)]"
                         >
-                            <svg class="size-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7" />
-                            </svg>
-                        </button>
-                        <button
-                            onclick={(e) => {
-                                e.stopPropagation();
-                                moveClipDown(clip.id!);
-                            }}
-                            class="p-1 hover:text-blue-400 disabled:opacity-30 disabled:cursor-not-allowed"
-                            title="Move Down"
-                            disabled={getIsLastClip(clip.id!)}
-                        >
-                            <svg class="size-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-                            </svg>
-                        </button>
+                            <span>{formatClock(clip.start_time)} → {formatClock(clip.end_time)}</span>
+                            <span class="opacity-60">
+                                {Math.max(0, Math.round(clip.end_time - clip.start_time))}s
+                            </span>
+                        </div>
                     </div>
-                    <button
-                        onclick={(e) => handleCopy(clip, e)}
-                        class="p-1 hover:text-blue-400"
-                        title="Copy Embed"
-                    >
-                        <svg
-                            class="size-4"
-                            fill="none"
-                            viewBox="0 0 24 24"
-                            stroke="currentColor"
-                            ><path
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                stroke-width="2"
-                                d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
-                            /></svg
+
+                    <div class="row-actions pt-0.5">
+                        {#if touch}
+                            <button
+                                class="icon-btn"
+                                style="--size: 40px"
+                                disabled={index === 0}
+                                onclick={(e) => {
+                                    e.stopPropagation();
+                                    move(clip.id!, -1);
+                                }}
+                                aria-label="Move up"><Icon name="arrowUp" size={16} /></button
+                            >
+                            <button
+                                class="icon-btn"
+                                style="--size: 40px"
+                                disabled={index === clips.length - 1}
+                                onclick={(e) => {
+                                    e.stopPropagation();
+                                    move(clip.id!, 1);
+                                }}
+                                aria-label="Move down"><Icon name="arrowDown" size={16} /></button
+                            >
+                        {/if}
+                        <button
+                            class="icon-btn"
+                            onclick={(e) => {
+                                e.stopPropagation();
+                                editingClip = clip;
+                            }}
+                            title="Edit range"
+                            aria-label="Edit clip"><Icon name="pencil" size={14} /></button
                         >
-                    </button>
-                    <button
-                        onclick={(e) => {
-                            e.stopPropagation();
-                            handleDelete(clip.id!);
-                        }}
-                        class="p-1 hover:text-red-400"
-                        title="Delete"
-                    >
-                        <svg
-                            class="size-4"
-                            fill="none"
-                            viewBox="0 0 24 24"
-                            stroke="currentColor"
-                            ><path
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                stroke-width="2"
-                                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-                            /></svg
+                        <button
+                            class="icon-btn"
+                            onclick={(e) => handleCopy(clip, e)}
+                            title="Copy"
+                            aria-label="Copy clip"><Icon name="copy" size={14} /></button
                         >
-                    </button>
+                        <button
+                            class="icon-btn icon-btn-danger"
+                            onclick={(e) => {
+                                e.stopPropagation();
+                                handleDelete(clip.id!);
+                            }}
+                            title="Delete"
+                            aria-label="Delete clip"><Icon name="trash" size={14} /></button
+                        >
+                    </div>
                 </div>
-            </div>
-            <div class="text-xs text-zinc-500 font-mono">
-                {Math.floor(clip.start_time)}s - {Math.floor(clip.end_time)}s
-            </div>
+            {/each}
         </div>
-    {/each}
+
+        <div
+            class="shrink-0 border-t border-[color:var(--border)] p-2 flex items-center gap-2"
+        >
+            <button class="btn flex-1" onclick={handleCopyAll} style={touch ? "height: 44px" : ""}>
+                <Icon name="copy" size={14} />
+                Copy all {clips.length}
+            </button>
+        </div>
+    {/if}
 </div>

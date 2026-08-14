@@ -1,184 +1,189 @@
 <script lang="ts">
     import { appState } from "./state.svelte";
     import { updateVideoFolder, updateFolderParent, type Video, type Folder } from "./db";
+    import Icon from "./Icon.svelte";
 
+    /// Move without a drag. Touch cannot start an HTML5 drag, so this is the
+    /// only way to restructure the library on a phone — and on a desktop it is
+    /// the keyboard path.
     let {
         open = false,
         title = "Move to folder",
         excludeFolderId,
+        pickOnly = false,
         onClose,
     } = $props<{
         open: boolean;
         title?: string;
         excludeFolderId?: number;
+        /// Report the chosen folder through `getPickedFolder()` instead of
+        /// moving anything — used when the caller has not saved a row yet.
+        pickOnly?: boolean;
         onClose: () => void;
     }>();
 
     let selectedVideo = $state<Video | null>(null);
-    let selectedFolder = $state<Folder | null>(null);
     let movingFolder = $state<Folder | null>(null);
-    let movingFolderParent = $state<number | null>(null);
+    let browsing = $state<Folder | null>(null);
     let pickedFolderId = $state<number | null>(null);
-    let pickOnly = $state(false);
 
     export function moveVideo(v: Video) {
         selectedVideo = v;
-        selectedFolder = null;
         movingFolder = null;
-        pickOnly = false;
+        browsing = null;
     }
 
     export function moveFolder(f: Folder) {
         selectedVideo = null;
-        selectedFolder = null;
         movingFolder = f;
-        movingFolderParent = f.parent_id;
-        pickOnly = false;
+        browsing = null;
     }
 
     export function setSelectedVideo(v: Video) {
         selectedVideo = v;
-        selectedFolder = null;
         movingFolder = null;
-        pickOnly = true;
+        browsing = null;
     }
 
     export function getPickedFolder(): number | null {
         return pickedFolderId;
     }
 
-    function folderChain(id: number | null, chain: Folder[] = []): Folder[] {
-        if (id === null) return chain;
-        const f = appState.folders.find((f) => f.id === id);
-        if (!f) return chain;
-        return folderChain(f.parent_id, [f, ...chain]);
+    /// A folder cannot be moved inside itself or its own descendants.
+    function isDescendantOf(folder: Folder, ancestorId: number): boolean {
+        let cursor: number | null | undefined = folder.parent_id;
+        while (cursor !== null && cursor !== undefined) {
+            if (cursor === ancestorId) return true;
+            cursor = appState.folders.find((f) => f.id === cursor)?.parent_id;
+        }
+        return false;
     }
 
-    let candidateFolders = $derived(
+    const candidates = $derived(
         appState.folders.filter((f) => {
             if (excludeFolderId !== undefined && f.id === excludeFolderId) return false;
-            if (selectedFolder?.id !== undefined) {
-                let cur: number | null | undefined = f.parent_id;
-                while (cur !== null && cur !== undefined) {
-                    if (cur === selectedFolder.id) return false;
-                    const parent = appState.folders.find((p) => p.id === cur);
-                    cur = parent?.parent_id;
-                }
-            }
-            if (movingFolder?.id !== undefined) {
-                let cur: number | null | undefined = f.parent_id;
-                while (cur !== null && cur !== undefined) {
-                    if (cur === movingFolder.id) return false;
-                    const parent = appState.folders.find((p) => p.id === cur);
-                    cur = parent?.parent_id;
-                }
-            }
+            if (movingFolder?.id !== undefined && isDescendantOf(f, movingFolder.id)) return false;
             return true;
         }),
     );
 
+    const shown = $derived(
+        candidates
+            .filter((f) => f.parent_id === (browsing?.id ?? null))
+            .sort((a, b) => a.sort_order - b.sort_order),
+    );
+
+    const trail = $derived.by(() => {
+        const chain: Folder[] = [];
+        let cursor: Folder | null = browsing;
+        while (cursor) {
+            chain.unshift(cursor);
+            const parentId: number | null = cursor.parent_id;
+            cursor = parentId === null ? null : (appState.folders.find((f) => f.id === parentId) ?? null);
+        }
+        return chain;
+    });
+
     async function pick(target: number | null) {
+        pickedFolderId = target;
         if (pickOnly) {
-            pickedFolderId = target;
             onClose();
             return;
         }
-        if (selectedVideo) {
-            await updateVideoFolder(selectedVideo.id, target);
-            await appState.refreshVideos();
-            appState.showToast(`Moved "${selectedVideo.title}"`, "success");
-        } else if (movingFolder && movingFolder.id !== undefined) {
-            await updateFolderParent(movingFolder.id, target);
-            await appState.refreshFolders();
-            appState.showToast(`Moved folder "${movingFolder.name}"`, "success");
+        try {
+            if (selectedVideo) {
+                await updateVideoFolder(selectedVideo.id, target);
+                await appState.refreshVideos();
+                appState.showToast(`Moved “${selectedVideo.title}”`, "success");
+            } else if (movingFolder?.id !== undefined) {
+                await updateFolderParent(movingFolder.id, target);
+                await appState.refreshFolders();
+                appState.showToast(`Moved folder “${movingFolder.name}”`, "success");
+            }
+        } catch (e) {
+            appState.showToast(`Could not move: ${String(e)}`, "error");
         }
         onClose();
-    }
-
-    function jumpInto(f: Folder) {
-        selectedFolder = f;
-    }
-
-    function jumpOut() {
-        selectedFolder = null;
     }
 </script>
 
 {#if open}
     <div
-        class="fixed inset-0 z-[250] bg-black/70 flex items-end md:items-center justify-center p-0 md:p-4"
+        class="overlay z-[250] items-end md:items-center justify-center md:p-4"
         onclick={onClose}
         role="presentation"
     >
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
         <div
-            class="w-full md:max-w-md bg-[color:var(--surface)] border border-[color:var(--border)] rounded-t-2xl md:rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
+            class="dialog w-full md:max-w-md rounded-b-none md:rounded-xl flex flex-col max-h-[80dvh] overflow-hidden"
             onclick={(e) => e.stopPropagation()}
             role="dialog"
-            aria-modal="true"
             tabindex="-1"
+            aria-modal="true"
+            aria-label={title}
             onkeydown={(e) => e.key === "Escape" && onClose()}
         >
-            <div class="p-4 border-b border-[color:var(--border)] flex items-center justify-between">
-                <h3 class="font-bold">{title}</h3>
-                <button
-                    onclick={onClose}
-                    class="min-w-[48px] min-h-[48px] flex items-center justify-center hover:bg-zinc-800 rounded-full"
-                    aria-label="Close"
-                >
-                    <svg class="size-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
+            <header class="panel-head">
+                <h3 class="flex-1 min-w-0 truncate text-[13px] font-semibold">{title}</h3>
+                <button class="icon-btn" onclick={onClose} aria-label="Close">
+                    <Icon name="close" size={15} />
                 </button>
-            </div>
+            </header>
 
-            {#if selectedFolder}
-                <div class="px-4 py-2 text-xs text-zinc-500 border-b border-[color:var(--border)]">
-                    Inside: {selectedFolder.name}
-                </div>
+            <!-- Where the move would land, and how to go back up. -->
+            <nav class="flex items-center gap-1 px-3 py-2 text-xs border-b border-[color:var(--border)] overflow-x-auto scrollbar-none">
                 <button
-                    onclick={jumpOut}
-                    class="px-4 py-3 text-left text-sm hover:bg-[color:var(--surface-hi)] flex items-center gap-2 border-b border-[color:var(--border)]"
+                    class="shrink-0 px-1 rounded hover:text-[color:var(--text)] {browsing
+                        ? 'text-[color:var(--text-faint)]'
+                        : 'text-[color:var(--text)]'}"
+                    onclick={() => (browsing = null)}>Library</button
                 >
-                    <svg class="size-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
-                    </svg>
-                    Up one level
-                </button>
-            {/if}
+                {#each trail as folder (folder.id)}
+                    <Icon name="chevronRight" size={11} />
+                    <button
+                        class="shrink-0 px-1 rounded truncate max-w-[140px] hover:text-[color:var(--text)] {browsing?.id ===
+                        folder.id
+                            ? 'text-[color:var(--text)]'
+                            : 'text-[color:var(--text-faint)]'}"
+                        onclick={() => (browsing = folder)}>{folder.name}</button
+                    >
+                {/each}
+            </nav>
 
-            <div class="flex-1 overflow-y-auto">
-                <button
-                    onclick={() => pick(selectedFolder?.id ?? null)}
-                    class="w-full px-4 py-3 text-left text-sm hover:bg-[color:var(--surface-hi)] flex items-center gap-2 border-b border-[color:var(--border)] text-blue-400"
-                >
-                    <svg class="size-4" fill="currentColor" viewBox="0 0 24 24">
-                        <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                    </svg>
-                    {selectedFolder ? `Move into "${selectedFolder.name}"` : "Move to root"}
-                </button>
-                {#each candidateFolders.filter((f) => f.parent_id === (selectedFolder?.id ?? null)) as folder (folder.id)}
+            <div class="flex-1 min-h-0 overflow-y-auto scroll-thin">
+                {#each shown as folder (folder.id)}
                     <div class="flex items-center border-b border-[color:var(--border)]">
                         <button
-                            onclick={() => jumpInto(folder)}
-                            class="flex-1 px-4 py-3 text-left text-sm hover:bg-[color:var(--surface-hi)] truncate"
+                            class="row row-touch md:row flex-1 min-w-0"
+                            style="min-height: 48px"
+                            onclick={() => (browsing = folder)}
                         >
-                            📁 {folder.name}
+                            <Icon name="folder" size={16} />
+                            <span class="flex-1 truncate text-[13px] text-left">{folder.name}</span>
+                            <Icon name="chevronRight" size={14} />
                         </button>
                         <button
+                            class="btn btn-ghost shrink-0 mr-2"
+                            style="color: var(--accent)"
                             onclick={() => folder.id !== undefined && pick(folder.id)}
-                            class="px-4 py-3 text-xs text-blue-400 hover:bg-[color:var(--surface-hi)]"
-                            title="Move here"
                         >
                             Move here
                         </button>
                     </div>
                 {/each}
-                {#if candidateFolders.filter((f) => f.parent_id === (selectedFolder?.id ?? null)).length === 0}
-                    <div class="px-4 py-8 text-center text-zinc-500 text-sm">
-                        No subfolders
-                    </div>
+                {#if shown.length === 0}
+                    <p class="px-4 py-8 text-center text-sm text-[color:var(--text-faint)]">
+                        No folders inside {browsing?.name ?? "the library"}
+                    </p>
                 {/if}
             </div>
+
+            <footer class="shrink-0 p-3 border-t border-[color:var(--border)]">
+                <button class="btn btn-primary w-full" style="height: 40px" onclick={() => pick(browsing?.id ?? null)}>
+                    Move into {browsing ? `“${browsing.name}”` : "the library root"}
+                </button>
+            </footer>
         </div>
     </div>
 {/if}

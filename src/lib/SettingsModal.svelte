@@ -8,6 +8,18 @@
         setGithubConfig,
         clearGithubToken,
     } from "./db";
+    import { save, open } from "@tauri-apps/plugin-dialog";
+    import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
+    import { invoke } from "@tauri-apps/api/core";
+    import ConfirmDialog from "./ConfirmDialog.svelte";
+    import Icon from "./Icon.svelte";
+    import Modal from "./Modal.svelte";
+
+    /// Settings used to be one column six screens tall with no scroll
+    /// container, so on a phone the buttons at the bottom were unreachable.
+    /// Three tabs, one scroll region, one footer.
+    type Tab = "copying" | "sync" | "data";
+    let tab = $state<Tab>("copying");
 
     let template = $state(appState.settings.clipboardTemplate);
     let draftRepo = $state(appState.settings.githubRepo);
@@ -18,6 +30,7 @@
     let isSavingCredentials = $state(false);
     let localSyncMessage = $state<{ ok: boolean; text: string } | null>(null);
     let credentialMessage = $state<{ ok: boolean; text: string } | null>(null);
+    let dbPath = $state("Loading…");
 
     let confirmState = $state<{
         open: boolean;
@@ -75,48 +88,9 @@
         tokenConfigured = appState.settings.githubTokenPresent;
     });
 
-    async function handleSaveCredentials() {
-        isSavingCredentials = true;
-        credentialMessage = null;
-        try {
-            await setGithubConfig(draftRepo, draftToken || null, draftVault);
-            if (draftToken) {
-                draftToken = "";
-            }
-            await appState.refreshGithubConfig();
-            credentialMessage = {
-                ok: true,
-                text: tokenConfigured ? "Credentials updated" : "Credentials saved",
-            };
-        } catch (e) {
-            credentialMessage = { ok: false, text: `Failed: ${String(e)}` };
-        } finally {
-            isSavingCredentials = false;
-        }
-    }
-
-    async function handleClearToken() {
-        const confirmed = await showConfirm({
-            title: "Clear GitHub token?",
-            message:
-                "Clear the stored GitHub token? Sync will stop working until you add a new one.",
-            confirmLabel: "Clear token",
-            danger: true,
-        });
-        if (!confirmed && confirmed !== "") return;
-        try {
-            await clearGithubToken();
-            await appState.refreshGithubConfig();
-            credentialMessage = { ok: true, text: "Token cleared" };
-        } catch (e) {
-            credentialMessage = { ok: false, text: `Failed: ${String(e)}` };
-        }
-    }
-
-    function handleSave() {
-        appState.updateSettings({ clipboardTemplate: template });
-        appState.isSettingsModalOpen = false;
-    }
+    $effect(() => {
+        getDbPath().then((p) => (dbPath = p));
+    });
 
     // Three shapes a clip gets copied as. `@video` and `clip:` are what the
     // vault understands: the first makes the moment a section-level fact, the
@@ -139,20 +113,61 @@
         },
     ];
 
-    function handleReset() {
-        template = PRESETS[0].value;
+    const PLACEHOLDERS = [
+        "{id}",
+        "{start}",
+        "{end}",
+        "{title}",
+        "{url}",
+        "{url_clean}",
+        "{start_hms}",
+        "{end_hms}",
+    ];
+
+    function close() {
+        appState.isSettingsModalOpen = false;
     }
 
-    import { save, open } from "@tauri-apps/plugin-dialog";
-    import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
-    import { invoke } from "@tauri-apps/api/core";
-    import ConfirmDialog from "./ConfirmDialog.svelte";
+    function handleSave() {
+        appState.updateSettings({ clipboardTemplate: template });
+        appState.showToast("Settings saved", "success");
+        close();
+    }
 
-    let dbPath = $state("Loading...");
+    async function handleSaveCredentials() {
+        isSavingCredentials = true;
+        credentialMessage = null;
+        try {
+            await setGithubConfig(draftRepo, draftToken || null, draftVault);
+            if (draftToken) draftToken = "";
+            await appState.refreshGithubConfig();
+            credentialMessage = {
+                ok: true,
+                text: tokenConfigured ? "Credentials updated" : "Credentials saved",
+            };
+        } catch (e) {
+            credentialMessage = { ok: false, text: `Failed: ${String(e)}` };
+        } finally {
+            isSavingCredentials = false;
+        }
+    }
 
-    $effect(() => {
-        getDbPath().then((p) => (dbPath = p));
-    });
+    async function handleClearToken() {
+        const confirmed = await showConfirm({
+            title: "Clear GitHub token?",
+            message: "Sync will stop working until you add a new one.",
+            confirmLabel: "Clear token",
+            danger: true,
+        });
+        if (confirmed === undefined) return;
+        try {
+            await clearGithubToken();
+            await appState.refreshGithubConfig();
+            credentialMessage = { ok: true, text: "Token cleared" };
+        } catch (e) {
+            credentialMessage = { ok: false, text: `Failed: ${String(e)}` };
+        }
+    }
 
     async function handlePickVault() {
         try {
@@ -163,25 +178,28 @@
         }
     }
 
+    async function handleSyncNow() {
+        localSyncMessage = null;
+        isSyncing = true;
+        const result = await appState.triggerSync();
+        isSyncing = false;
+        localSyncMessage = result.success
+            ? { ok: true, text: result.detail ? `Synced — ${result.detail}` : "Synced" }
+            : { ok: false, text: `Sync failed: ${result.error || "unknown error"}` };
+    }
+
     async function handleChangeDb() {
         try {
             const path = await save({
-                title: "Select or Create Database File",
+                title: "Select or create a database file",
                 defaultPath: "yclippy.db",
-                filters: [
-                    {
-                        name: "SQLite Database",
-                        extensions: ["db", "sqlite", "sqlite3"],
-                    },
-                ],
+                filters: [{ name: "SQLite database", extensions: ["db", "sqlite", "sqlite3"] }],
             });
-
-            if (path) {
-                await setDbPath(path);
-                dbPath = path;
-                await appState.refreshAll();
-                appState.showToast("Database path updated", "success");
-            }
+            if (!path) return;
+            await setDbPath(path);
+            dbPath = path;
+            await appState.refreshAll();
+            appState.showToast("Database path updated", "success");
         } catch (e) {
             console.error(e);
             appState.showToast(`Failed to change database: ${String(e)}`, "error");
@@ -191,20 +209,13 @@
     async function handleExport() {
         try {
             const path = await save({
-                filters: [
-                    {
-                        name: "JSON",
-                        extensions: ["json"],
-                    },
-                ],
+                filters: [{ name: "JSON", extensions: ["json"] }],
                 defaultPath: "yclippy_backup.json",
             });
-
-            if (path) {
-                const data = await exportDb();
-                await writeTextFile(path, JSON.stringify(data, null, 2));
-                appState.showToast("Data exported successfully", "success");
-            }
+            if (!path) return;
+            const data = await exportDb();
+            await writeTextFile(path, JSON.stringify(data, null, 2));
+            appState.showToast("Data exported", "success");
         } catch (e) {
             console.error(e);
             appState.showToast(`Export failed: ${String(e)}`, "error");
@@ -215,322 +226,241 @@
         const confirmed = await showConfirm({
             title: "Import data?",
             message:
-                "Importing data will overwrite/merge with existing data. It is recommended to backup first.",
+                "Importing merges the file into your library and can overwrite rows. Export a backup first.",
             confirmLabel: "Continue",
         });
         if (confirmed === undefined) return;
-
         try {
-            const path = await open({
-                filters: [
-                    {
-                        name: "JSON",
-                        extensions: ["json"],
-                    },
-                ],
-            });
-
-            if (path) {
-                const content = await readTextFile(path);
-                const data = JSON.parse(content);
-                await importDb(data);
-                await appState.refreshFolders();
-                await appState.refreshVideos();
-                appState.showToast("Data imported successfully", "success");
-            }
+            const path = await open({ filters: [{ name: "JSON", extensions: ["json"] }] });
+            if (!path) return;
+            const content = await readTextFile(path as string);
+            await importDb(JSON.parse(content));
+            await appState.refreshFolders();
+            await appState.refreshVideos();
+            appState.showToast("Data imported", "success");
         } catch (e) {
             console.error(e);
             appState.showToast(`Import failed: ${String(e)}`, "error");
         }
     }
+
     async function handleImportFromYtRenamer() {
         const confirmed = await showConfirm({
             title: "Import from ytRenamer?",
-            message:
-                "Importing from ytRenamer will add videos and clips to your library.",
+            message: "This adds videos and clips to your library.",
             confirmLabel: "Continue",
         });
         if (confirmed === undefined) return;
-
         try {
             const path = await open({
-                filters: [
-                    {
-                        name: "JSON",
-                        extensions: ["json"],
-                    },
-                ],
-                title: "Select ytRenamer Export File",
+                filters: [{ name: "JSON", extensions: ["json"] }],
+                title: "Select a ytRenamer export",
             });
-
-            if (path) {
-                const youtubeUrl = await showConfirm({
-                    title: "YouTube URL",
-                    message:
-                        "Enter the YouTube URL that this ytRenamer clip list belongs to.",
-                    confirmLabel: "Import",
-                    withInput: true,
-                    promptPlaceholder: "https://youtube.com/watch?v=...",
-                });
-                if (!youtubeUrl) return;
-
-                const content = await readTextFile(path);
-                const count = await invoke("import_from_yt_renamer", { fileContent: content, youtubeUrl });
-                await appState.refreshVideos();
-                await appState.refreshActiveClips();
-                appState.showToast(`Imported ${count} clips from ytRenamer`, "success");
-            }
+            if (!path) return;
+            const youtubeUrl = await showConfirm({
+                title: "Which video?",
+                message: "Enter the YouTube URL this clip list belongs to.",
+                confirmLabel: "Import",
+                withInput: true,
+                promptPlaceholder: "https://www.youtube.com/watch?v=…",
+            });
+            if (!youtubeUrl) return;
+            const content = await readTextFile(path as string);
+            const count = await invoke("import_from_yt_renamer", {
+                fileContent: content,
+                youtubeUrl,
+            });
+            await appState.refreshVideos();
+            await appState.refreshActiveClips();
+            appState.showToast(`Imported ${count} clips`, "success");
         } catch (e) {
             console.error(e);
             appState.showToast(`Import failed: ${String(e)}`, "error");
-        }
-    }
-
-    async function handleSyncNow() {
-        localSyncMessage = null;
-        isSyncing = true;
-        const result = await appState.triggerSync();
-        isSyncing = false;
-        if (result.success) {
-            localSyncMessage = {
-                ok: true,
-                text: result.detail ? `Synced — ${result.detail}` : "Synced",
-            };
-        } else {
-            localSyncMessage = { ok: false, text: `Sync failed: ${result.error || "unknown error"}` };
         }
     }
 </script>
 
-<div
-    class="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
->
-    <div
-        class="w-full max-w-lg bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-2xl"
-    >
-        <h3 class="text-lg font-bold text-white mb-6">Settings</h3>
-
-        <div class="mb-6">
-            <label
-                class="block text-sm font-medium text-zinc-400 mb-2"
-                for="template"
+<Modal title="Settings" onClose={close} size="lg">
+    <nav class="flex gap-1 mb-4 border-b border-[color:var(--border)] -mt-1">
+        {#each [["copying", "Copying"], ["sync", "Sync"], ["data", "Data"]] as [id, label] (id)}
+            <button
+                class="px-3 py-2 text-[13px] border-b-2 -mb-px transition-colors {tab === id
+                    ? 'border-[color:var(--accent)] text-[color:var(--text)]'
+                    : 'border-transparent text-[color:var(--text-faint)] hover:text-[color:var(--text-dim)]'}"
+                onclick={() => (tab = id as Tab)}
             >
-                Clipboard Export Template
-            </label>
-            <p class="text-xs text-zinc-500 mb-2">
-                Available placeholders: <code class="bg-zinc-800 px-1 rounded"
-                    >{"{id}"}</code
-                > <code class="bg-zinc-800 px-1 rounded">{"{start}"}</code>
-                <code class="bg-zinc-800 px-1 rounded">{"{end}"}</code>
-                <code class="bg-zinc-800 px-1 rounded">{"{title}"}</code>
-                <code class="bg-zinc-800 px-1 rounded">{"{url}"}</code>
-                <code class="bg-zinc-800 px-1 rounded">{"{start_hms}"}</code>
-                <code class="bg-zinc-800 px-1 rounded">{"{end_hms}"}</code>
-                <code class="bg-zinc-800 px-1 rounded">{"{url_clean}"}</code>
-            </p>
-            <div class="flex flex-wrap gap-2 mb-2">
+                {label}
+            </button>
+        {/each}
+    </nav>
+
+    {#if tab === "copying"}
+        <div class="flex flex-col gap-3">
+            <div class="flex flex-wrap gap-2">
                 {#each PRESETS as preset (preset.name)}
                     <button
                         onclick={() => (template = preset.value)}
                         title={preset.hint}
-                        class="px-2.5 py-1 text-xs rounded border transition {template ===
-                        preset.value
-                            ? 'border-[color:var(--accent)] text-[color:var(--text)]'
-                            : 'border-zinc-800 text-zinc-400 hover:border-zinc-700'}"
+                        class="btn {template === preset.value ? 'btn-primary' : ''}"
                     >
                         {preset.name}
                     </button>
                 {/each}
             </div>
-            <textarea
-                id="template"
-                bind:value={template}
-                rows="4"
-                class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-600 transition font-mono text-xs leading-relaxed"
-            ></textarea>
-            <button
-                onclick={handleReset}
-                class="text-xs text-blue-500 hover:text-blue-400 mt-2"
-            >
-                Reset to Default
-            </button>
-        </div>
 
-        <div class="mb-6 pt-6 border-t border-zinc-800">
-            <h4 class="text-sm font-medium text-white mb-4">GitHub Sync</h4>
-            <div class="space-y-4">
-                <div>
-                    <label
-                        for="repo-url"
-                        class="block text-xs font-medium text-zinc-400 mb-1"
-                    >
-                        Repository URL
-                    </label>
-                    <input
-                        id="repo-url"
-                        type="text"
-                        bind:value={draftRepo}
-                        placeholder="https://github.com/username/repo.git"
-                        class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-600 transition text-sm"
-                    />
-                </div>
-                <div>
-                    <label
-                        for="vault-path"
-                        class="block text-xs font-medium text-zinc-400 mb-1"
-                    >
-                        Vault folder <span class="text-zinc-600">(optional)</span>
-                    </label>
-                    <div class="flex gap-2">
-                        <input
-                            id="vault-path"
-                            type="text"
-                            bind:value={draftVault}
-                            placeholder="~/Notes"
-                            class="flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-600 transition text-sm"
-                        />
-                        <button
-                            onclick={handlePickVault}
-                            class="px-3 py-2 text-sm rounded-lg border border-zinc-800 text-zinc-300 hover:border-zinc-700 transition shrink-0"
-                        >
-                            Browse
-                        </button>
-                    </div>
-                    <p class="text-[11px] text-zinc-500 mt-1">
-                        Set this and desktop sync also writes the library to
-                        <code class="bg-zinc-800 px-1 rounded">&lt;vault&gt;/.notes/yclippy/</code>,
-                        so <code class="bg-zinc-800 px-1 rounded">yalive sync</code> carries it through git.
-                    </p>
-                </div>
-                <div>
-                    <label
-                        for="gh-token"
-                        class="block text-xs font-medium text-zinc-400 mb-1"
-                    >
-                        Classic Access Token {tokenConfigured ? "(configured — paste to replace)" : ""}
-                    </label>
-                    <input
-                        id="gh-token"
-                        type="password"
-                        bind:value={draftToken}
-                        placeholder={tokenConfigured ? "•••••••• (already saved)" : "ghp_..."}
-                        class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-600 transition text-sm"
-                    />
-                    <p class="text-xs text-zinc-500 mt-1">
-                        Stored in app-private config. Never exposed to the webview.
-                    </p>
-                </div>
-                <div class="flex gap-2">
+            <div>
+                <label class="label" for="template">Template</label>
+                <textarea
+                    id="template"
+                    bind:value={template}
+                    rows="4"
+                    class="field font-mono text-xs leading-relaxed"
+                ></textarea>
+            </div>
+
+            <div class="flex flex-wrap gap-1.5">
+                {#each PLACEHOLDERS as placeholder (placeholder)}
                     <button
-                        onclick={handleSaveCredentials}
-                        disabled={isSavingCredentials || !draftRepo}
-                        class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white text-sm font-medium transition"
+                        class="chip hover:text-[color:var(--text)] transition-colors"
+                        title="Insert {placeholder}"
+                        onclick={() => (template += placeholder)}
                     >
-                        {isSavingCredentials ? "Saving…" : "Save Credentials"}
+                        {placeholder}
                     </button>
-                    {#if tokenConfigured}
-                        <button
-                            onclick={handleClearToken}
-                            class="px-4 py-2 bg-zinc-800 hover:bg-red-900 rounded-lg text-zinc-300 text-sm font-medium transition border border-zinc-700"
-                        >
-                            Clear Token
-                        </button>
-                    {/if}
-                </div>
-                {#if credentialMessage}
-                    <p class="text-xs text-center {credentialMessage.ok ? 'text-green-400' : 'text-red-400'}">
-                        {credentialMessage.text}
-                    </p>
-                {/if}
-                <button
-                    onclick={handleSyncNow}
-                    disabled={isSyncing || !tokenConfigured || !draftRepo}
-                    class="w-full py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-zinc-300 font-medium transition border border-zinc-700 hover:border-zinc-500 flex items-center justify-center gap-2"
-                >
-                    <svg
-                        xmlns="http://www.w3.org/2000/svg"
-                        width="16"
-                        height="16"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        class="lucide lucide-refresh-cw {isSyncing ? 'animate-spin' : ''}"
-                        ><path
-                            d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"
-                        /><path d="M21 3v5h-5" /><path
-                            d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"
-                        /><path d="M3 21v-5h5" /></svg
-                    >
-                    {isSyncing ? "Syncing..." : "Sync Now"}
-                </button>
-                {#if localSyncMessage}
-                    <p class="text-xs text-center {localSyncMessage.ok ? 'text-green-400' : 'text-red-400'}">
-                        {localSyncMessage.text}
-                    </p>
-                {/if}
-                {#if appState.settings.lastSyncAt && localSyncMessage?.ok}
-                    <p class="text-xs text-zinc-500 text-center mt-2">
-                        Last synced: {new Date(appState.settings.lastSyncAt).toLocaleString()}
-                    </p>
-                {/if}
+                {/each}
             </div>
-        </div>
 
-        <div class="mb-6 pt-6 border-t border-zinc-800">
-            <h4 class="text-sm font-medium text-white mb-4">Data Management</h4>
-            <div class="flex gap-4 mb-4">
-                <button
-                    onclick={handleExport}
-                    class="flex-1 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-zinc-300 font-medium transition border border-zinc-700 hover:border-zinc-500"
-                >
-                    Export All Data
-                </button>
-                <button
-                    onclick={handleImport}
-                    class="flex-1 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-zinc-300 font-medium transition border border-zinc-700 hover:border-zinc-500"
-                >
-                    Import Data
-                </button>
+            <p class="text-xs text-[color:var(--text-faint)]">
+                {PRESETS.find((p) => p.value === template)?.hint ??
+                    "Click a placeholder to append it."}
+            </p>
+        </div>
+    {:else if tab === "sync"}
+        <div class="flex flex-col gap-4">
+            <div>
+                <label class="label" for="repo-url">Repository URL</label>
+                <input
+                    id="repo-url"
+                    type="text"
+                    bind:value={draftRepo}
+                    placeholder="https://github.com/username/repo.git"
+                    class="field"
+                />
             </div>
+
+            <div>
+                <label class="label" for="vault-path">
+                    Vault folder <span class="text-[color:var(--text-faint)]">(optional)</span>
+                </label>
+                <div class="flex gap-2">
+                    <input
+                        id="vault-path"
+                        type="text"
+                        bind:value={draftVault}
+                        placeholder="~/Notes"
+                        class="field flex-1 min-w-0"
+                    />
+                    <button onclick={handlePickVault} class="btn shrink-0">Browse</button>
+                </div>
+                <p class="text-[11px] text-[color:var(--text-faint)] mt-1.5 leading-relaxed">
+                    Set this and desktop sync also writes the library to
+                    <code class="chip">&lt;vault&gt;/.notes/yclippy/</code>, so
+                    <code class="chip">yalive sync</code> carries it through git.
+                </p>
+            </div>
+
+            <div>
+                <label class="label" for="gh-token">
+                    Access token
+                    {#if tokenConfigured}
+                        <span class="text-[color:var(--text-faint)]">— saved, paste to replace</span>
+                    {/if}
+                </label>
+                <input
+                    id="gh-token"
+                    type="password"
+                    bind:value={draftToken}
+                    placeholder={tokenConfigured ? "•••••••• already saved" : "ghp_…"}
+                    class="field"
+                />
+                <p class="text-[11px] text-[color:var(--text-faint)] mt-1.5">
+                    Stored in app-private config. Never exposed to the webview.
+                </p>
+            </div>
+
+            <div class="flex gap-2">
+                <button
+                    onclick={handleSaveCredentials}
+                    disabled={isSavingCredentials || !draftRepo}
+                    class="btn btn-primary flex-1"
+                >
+                    {isSavingCredentials ? "Saving…" : "Save credentials"}
+                </button>
+                {#if tokenConfigured}
+                    <button onclick={handleClearToken} class="btn btn-danger">Clear token</button>
+                {/if}
+            </div>
+
+            {#if credentialMessage}
+                <p
+                    class="text-xs text-center"
+                    style="color: {credentialMessage.ok ? 'var(--success)' : 'var(--danger)'}"
+                >
+                    {credentialMessage.text}
+                </p>
+            {/if}
+
             <button
-                onclick={handleImportFromYtRenamer}
-                class="w-full py-2 bg-blue-900/50 hover:bg-blue-900 rounded-lg text-blue-300 font-medium transition border border-blue-800 hover:border-blue-600"
+                onclick={handleSyncNow}
+                disabled={isSyncing || !tokenConfigured || !draftRepo}
+                class="btn w-full"
             >
+                <span class={isSyncing ? "animate-spin" : ""}><Icon name="sync" size={14} /></span>
+                {isSyncing ? "Syncing…" : "Sync now"}
+            </button>
+
+            {#if localSyncMessage}
+                <p
+                    class="text-xs text-center"
+                    style="color: {localSyncMessage.ok ? 'var(--success)' : 'var(--danger)'}"
+                >
+                    {localSyncMessage.text}
+                </p>
+            {/if}
+            {#if appState.settings.lastSyncAt}
+                <p class="text-[11px] text-[color:var(--text-faint)] text-center">
+                    Last synced {new Date(appState.settings.lastSyncAt).toLocaleString()}
+                </p>
+            {/if}
+        </div>
+    {:else}
+        <div class="flex flex-col gap-4">
+            <div class="flex gap-2">
+                <button onclick={handleExport} class="btn flex-1">Export all data</button>
+                <button onclick={handleImport} class="btn flex-1">Import data</button>
+            </div>
+            <button onclick={handleImportFromYtRenamer} class="btn w-full">
                 Import from ytRenamer
             </button>
-        </div>
 
-        <div class="mb-6 pt-6 border-t border-zinc-800">
-            <h4 class="text-sm font-medium text-white mb-2">
-                Database Location
-            </h4>
-            <p class="text-xs text-zinc-500 mb-2 truncate">Current: {dbPath}</p>
-            <button
-                onclick={handleChangeDb}
-                class="w-full py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-zinc-300 font-medium transition border border-zinc-700 hover:border-zinc-500"
-            >
-                Change Database Location...
-            </button>
+            <div class="pt-4 border-t border-[color:var(--border)]">
+                <span class="label">Database file</span>
+                <p
+                    class="text-xs text-[color:var(--text-faint)] break-all mb-2 font-mono"
+                    title={dbPath}
+                >
+                    {dbPath}
+                </p>
+                <button onclick={handleChangeDb} class="btn w-full">Change location…</button>
+            </div>
         </div>
-        <div class="flex justify-end gap-3">
-            <button
-                onclick={() => (appState.isSettingsModalOpen = false)}
-                class="px-4 py-2 rounded-lg hover:bg-zinc-800 text-zinc-300 transition"
-            >
-                Cancel
-            </button>
-            <button
-                onclick={handleSave}
-                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white font-medium transition"
-            >
-                Save Changes
-            </button>
-        </div>
-    </div>
-</div>
+    {/if}
+
+    {#snippet footer()}
+        <button class="btn btn-ghost" onclick={close}>Cancel</button>
+        <button class="btn btn-primary" onclick={handleSave}>Save changes</button>
+    {/snippet}
+</Modal>
 
 <ConfirmDialog
     open={confirmState.open}

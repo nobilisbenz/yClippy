@@ -1,8 +1,11 @@
 <script lang="ts">
     import { onMount, onDestroy, untrack } from "svelte";
+    import { openUrl } from "@tauri-apps/plugin-opener";
     import { saveClip, type Video } from "./db";
     import { appState } from "./state.svelte";
     import { YouTubeController, formatClock } from "./youtube.svelte";
+    import CodecNotice from "./CodecNotice.svelte";
+    import Icon from "./Icon.svelte";
     import Track from "./Track.svelte";
 
     /// Desktop shell. Playback lives in YouTubeController; this file is layout,
@@ -21,13 +24,14 @@
     let clipTitle = $state("");
     let nameField = $state<HTMLInputElement | null>(null);
     let rate = $state(1);
+    let stageHover = $state(false);
 
-    const RATES = [0.75, 1, 1.25, 1.5, 2];
+    const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
     onMount(async () => {
+        window.addEventListener("keydown", handleKeyDown);
         await yt.mount(video, initialSeek);
         onSeekConsumed?.();
-        window.addEventListener("keydown", handleKeyDown);
     });
 
     onDestroy(async () => {
@@ -68,7 +72,7 @@
                 end_time: Math.floor(end),
                 title: clipTitle.trim() || `Clip at ${formatClock(yt.pendingStart)}`,
                 created_at: Date.now(),
-                sort_order: 0,
+                sort_order: appState.activeClips.length,
             });
             await appState.refreshActiveClips();
             appState.showToast("Clip saved", "success");
@@ -87,6 +91,14 @@
     function cycleRate() {
         rate = RATES[(RATES.indexOf(rate) + 1) % RATES.length];
         yt.setRate(rate);
+    }
+
+    async function openOnYouTube() {
+        try {
+            await openUrl(yt.watchUrl);
+        } catch (e) {
+            appState.showToast(`Could not open the browser: ${String(e)}`, "error");
+        }
     }
 
     function handleKeyDown(e: KeyboardEvent) {
@@ -152,32 +164,97 @@
 
 <div class="flex flex-col h-full min-h-0 bg-black">
     <!-- Stage -->
-    <div class="flex-1 min-h-0 relative bg-black">
-        <div class="absolute inset-0 flex items-center justify-center">
-            <div class="w-full h-full max-h-full" style="aspect-ratio: 16/9; max-width: 100%">
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+        class="flex-1 min-h-0 relative bg-black"
+        onmouseenter={() => (stageHover = true)}
+        onmouseleave={() => (stageHover = false)}
+    >
+        <div class="absolute inset-0 flex items-center justify-center p-2">
+            <div
+                class="relative w-full h-full max-h-full max-w-full"
+                style="aspect-ratio: 16/9"
+            >
                 <div id={yt.elementId} class="w-full h-full"></div>
+
+                {#if !yt.isReady && !yt.error}
+                    <!-- The stage is black either way; say which black it is. -->
+                    <div
+                        class="absolute inset-0 grid place-items-center pointer-events-none"
+                    >
+                        <span
+                            class="text-xs text-[color:var(--text-faint)] animate-pulse"
+                        >
+                            Loading player…
+                        </span>
+                    </div>
+                {/if}
+
+                {#if yt.error}
+                    <div
+                        class="absolute inset-0 grid place-items-center bg-[color:var(--bg)]/95 px-6"
+                    >
+                        <div class="flex flex-col items-center gap-3 text-center max-w-sm">
+                            <span class="text-[color:var(--danger)]">
+                                <Icon name="alert" size={22} />
+                            </span>
+                            <p class="text-sm text-[color:var(--text)]">{yt.error}</p>
+                            <div class="flex items-center gap-2">
+                                <button class="btn" onclick={() => yt.retry()}>
+                                    <Icon name="sync" size={14} />
+                                    Try again
+                                </button>
+                                <button class="btn btn-primary" onclick={openOnYouTube}>
+                                    <Icon name="external" size={14} />
+                                    Open on YouTube
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                {/if}
             </div>
         </div>
 
-        {#if yt.isPaused && yt.isReady}
+        <!-- Leaving is a top-level move, so the way out is always on screen —
+             it used to appear only while paused. -->
+        <div
+            class="absolute top-0 inset-x-0 z-20 p-2 flex items-center gap-2 transition-opacity duration-200"
+            class:opacity-0={!stageHover && !yt.isPaused && !yt.error}
+        >
             <button
-                class="absolute top-3 left-3 z-20 px-3 py-1.5 rounded-md bg-black/70 border border-[color:var(--border-hi)] text-xs text-[color:var(--text-dim)] hover:text-[color:var(--text)] transition"
+                class="btn btn-ghost bg-black/70 backdrop-blur-sm"
                 onclick={() => appState.goBack()}
+                title="Back to the library (Esc)"
             >
-                ← Library
+                <Icon name="back" size={14} />
+                Library
             </button>
-        {/if}
+            <div class="flex-1"></div>
+            <button
+                class="icon-btn bg-black/70 backdrop-blur-sm"
+                onclick={openOnYouTube}
+                title="Open on YouTube at the current time"
+                aria-label="Open on YouTube"
+            >
+                <Icon name="external" size={15} />
+            </button>
+        </div>
+
+        <div class="absolute left-3 bottom-3 z-20">
+            <CodecNotice />
+        </div>
     </div>
 
     <!-- Transport -->
     <div
-        class="shrink-0 border-t border-[color:var(--border)] bg-[color:var(--surface)] px-4 pt-3 pb-2"
+        class="shrink-0 border-t border-[color:var(--border)] bg-[color:var(--surface)] px-3 pt-2.5 pb-2"
     >
         <Track
             clips={appState.activeClips}
             duration={yt.duration}
             currentTime={yt.currentTime}
             watched={video.last_position}
+            loaded={yt.loaded}
             pendingStart={yt.pendingStart}
             pendingEnd={yt.pendingEnd}
             onSeek={(t) => yt.seek(t)}
@@ -198,7 +275,10 @@
                     commitClip();
                 }}
             >
-                <span class="text-[11px] t-num text-[color:var(--accent)] shrink-0">
+                <span
+                    class="chip t-num shrink-0"
+                    style="background: var(--accent-soft); color: var(--accent)"
+                >
                     {formatClock(yt.pendingStart ?? 0)} – {formatClock(
                         yt.pendingEnd ?? yt.currentTime,
                     )}
@@ -207,79 +287,111 @@
                     bind:this={nameField}
                     bind:value={clipTitle}
                     placeholder="Name this clip…"
-                    class="flex-1 min-w-0 bg-[color:var(--bg)] border border-[color:var(--border-hi)] rounded px-2 py-1 text-sm text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)]"
+                    class="field flex-1 min-w-0 py-1.5 text-sm"
                 />
-                <button
-                    type="submit"
-                    class="px-3 py-1 text-xs rounded bg-[color:var(--accent)] text-white"
-                >
-                    Save
-                </button>
+                <button type="submit" class="btn btn-primary shrink-0">Save clip</button>
                 <button
                     type="button"
                     onclick={discardClip}
-                    class="px-2 py-1 text-xs text-[color:var(--text-faint)] hover:text-[color:var(--text)]"
+                    class="icon-btn shrink-0"
+                    aria-label="Discard clip"
+                    title="Discard (Esc)"
                 >
-                    Cancel
+                    <Icon name="close" size={15} />
                 </button>
             </form>
         {:else}
             <div class="flex items-center gap-1 mt-2">
                 <button
-                    class="px-2 py-1 rounded text-[color:var(--text-dim)] hover:text-[color:var(--text)] hover:bg-[color:var(--surface-hi)] transition"
+                    class="icon-btn"
+                    style="--size: 32px"
                     onclick={() => yt.skip(-10)}
-                    title="Back 10s (j)"
-                    aria-label="Back 10 seconds">⏮</button
+                    title="Back 10 seconds (j)"
+                    aria-label="Back 10 seconds"
                 >
-                <button
-                    class="px-3 py-1 rounded text-[color:var(--text)] hover:bg-[color:var(--surface-hi)] transition"
-                    onclick={() => yt.toggle()}
-                    title="Play / pause (space)"
-                    aria-label={yt.isPaused ? "Play" : "Pause"}
-                >
-                    {yt.isPaused ? "▶" : "❚❚"}
+                    <Icon name="back10" size={18} />
                 </button>
                 <button
-                    class="px-2 py-1 rounded text-[color:var(--text-dim)] hover:text-[color:var(--text)] hover:bg-[color:var(--surface-hi)] transition"
+                    class="icon-btn text-[color:var(--text)]"
+                    style="--size: 36px"
+                    onclick={() => yt.toggle()}
+                    title={yt.isPaused ? "Play (space)" : "Pause (space)"}
+                    aria-label={yt.isPaused ? "Play" : "Pause"}
+                >
+                    <Icon name={yt.isPaused ? "play" : "pause"} size={20} />
+                </button>
+                <button
+                    class="icon-btn"
+                    style="--size: 32px"
                     onclick={() => yt.skip(10)}
-                    title="Forward 10s (l)"
-                    aria-label="Forward 10 seconds">⏭</button
+                    title="Forward 10 seconds (l)"
+                    aria-label="Forward 10 seconds"
                 >
+                    <Icon name="forward10" size={18} />
+                </button>
 
-                <div class="w-px h-4 bg-[color:var(--border)] mx-2"></div>
+                <div class="w-px h-5 bg-[color:var(--border)] mx-2"></div>
 
                 <button
-                    class="px-2 py-1 text-xs rounded border transition {yt.pendingStart !== null
-                        ? 'border-[color:var(--accent)] text-[color:var(--accent)]'
-                        : 'border-[color:var(--border-hi)] text-[color:var(--text-dim)] hover:text-[color:var(--text)]'}"
+                    class="btn"
+                    style={yt.pendingStart !== null
+                        ? "border-color: var(--accent); color: var(--accent)"
+                        : ""}
                     onclick={() => yt.markIn()}
-                    title="Mark in ([)">[ in</button
+                    title="Mark the clip's start at the playhead ([)"
                 >
+                    <Icon name="markIn" size={14} />
+                    In
+                </button>
                 <button
-                    class="px-2 py-1 text-xs rounded border border-[color:var(--border-hi)] text-[color:var(--text-dim)] hover:text-[color:var(--text)] transition"
+                    class="btn"
+                    style={yt.pendingEnd !== null
+                        ? "border-color: var(--accent); color: var(--accent)"
+                        : ""}
                     onclick={() => yt.markOut()}
-                    title="Mark out (])">out ]</button
+                    title="Mark the clip's end at the playhead (])"
                 >
+                    <Icon name="markOut" size={14} />
+                    Out
+                </button>
                 {#if yt.hasPending}
+                    <span class="chip t-num ml-1">
+                        {formatClock(yt.pendingStart ?? 0)} – {formatClock(
+                            yt.pendingEnd ?? yt.currentTime,
+                        )}
+                    </span>
+                    <button class="btn btn-primary" onclick={beginNaming} title="Name and save (Enter)">
+                        <Icon name="scissors" size={14} />
+                        Save clip
+                    </button>
                     <button
-                        class="px-2 py-1 text-xs rounded bg-[color:var(--accent)] text-white"
-                        onclick={beginNaming}
-                        title="Name and save (Enter)">Save clip</button
-                    >
-                    <button
-                        class="px-2 py-1 text-xs text-[color:var(--text-faint)] hover:text-[color:var(--text)]"
+                        class="icon-btn"
                         onclick={discardClip}
-                        title="Discard (Esc)">✕</button
+                        title="Discard (Esc)"
+                        aria-label="Discard clip"
                     >
+                        <Icon name="close" size={15} />
+                    </button>
                 {/if}
 
                 <div class="flex-1"></div>
 
-                <button
-                    class="px-2 py-1 text-xs t-num rounded border border-[color:var(--border-hi)] text-[color:var(--text-dim)] hover:text-[color:var(--text)] transition"
-                    onclick={cycleRate}
-                    title="Playback speed">{rate}×</button
+                <!-- The keys are the point of the app; showing them is cheaper
+                     than a help screen nobody opens. -->
+                <div
+                    class="hidden xl:flex items-center gap-1.5 text-[11px] text-[color:var(--text-faint)] mr-2"
                 >
+                    <kbd class="kbd">space</kbd>
+                    <span>play</span>
+                    <kbd class="kbd">j</kbd><kbd class="kbd">l</kbd>
+                    <span>±10s</span>
+                    <kbd class="kbd">[</kbd><kbd class="kbd">]</kbd>
+                    <span>mark</span>
+                </div>
+
+                <button class="btn t-num" onclick={cycleRate} title="Playback speed">
+                    {rate}×
+                </button>
             </div>
         {/if}
     </div>

@@ -6,8 +6,8 @@
   font-weight: 400;
 
   color-scheme: dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #000000;
+  color: var(--text);
+  background-color: var(--bg);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -17,6 +17,7 @@
   --bg: #08080a;
   --surface: #0f0f12;
   --surface-hi: #1a1a1f;
+  --surface-active: #212128;
   --border: #1f1f24;
   --border-hi: #2a2a30;
   --text: #f4f4f5;
@@ -24,8 +25,10 @@
   --text-faint: #52525b;
   --accent: #3b82f6;
   --accent-hover: #2563eb;
+  --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
   --danger: #ef4444;
   --danger-hover: #dc2626;
+  --success: #22c55e;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -33,8 +36,18 @@
   --space-4: 24px;
   --space-5: 32px;
 
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+
   --row-h: 32px;
-  --row-h-touch: 48px;
+  --row-h-touch: 56px;
+  --tap: 48px;
+  --titlebar-h: 40px;
+
+  --shadow-pop: 0 10px 30px -10px rgb(0 0 0 / 0.8), 0 2px 8px rgb(0 0 0 / 0.5);
+  --ease: cubic-bezier(0.2, 0, 0, 1);
 
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
@@ -46,13 +59,12 @@ body {
   margin: 0;
   min-width: 320px;
   width: 100%;
-  height: 100vh;
   height: 100dvh;
   overflow: hidden;
+  background: var(--bg);
 }
 
 #app {
-  height: 100vh;
   height: 100dvh;
   width: 100%;
   display: flex;
@@ -65,6 +77,12 @@ body {
   border-radius: 2px;
 }
 
+/* The focus ring is the only selection signal on a black ground, so it must
+   never be suppressed — but it should not fire on a plain pointer press. */
+button:focus:not(:focus-visible) {
+  outline: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -75,13 +93,275 @@ body {
   }
 }
 
-.scrollbar-none::-webkit-scrollbar {
-  display: none;
+@layer components {
+  /* ── surfaces ─────────────────────────────────────────────────────── */
+
+  .panel {
+    background: var(--surface);
+    border-color: var(--border);
+  }
+
+  /* A panel header: one height everywhere, so the three columns of the
+     desktop layout line up across their tops. */
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    height: 40px;
+    padding-inline: 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .section-label {
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+
+  /* ── controls ─────────────────────────────────────────────────────── */
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 30px;
+    padding-inline: 12px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border-hi);
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 13px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background-color 120ms var(--ease),
+      color 120ms var(--ease),
+      border-color 120ms var(--ease);
+  }
+  .btn:hover:not(:disabled) {
+    background: var(--surface-hi);
+    color: var(--text);
+  }
+  .btn:active:not(:disabled) {
+    background: var(--surface-active);
+  }
+  .btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 500;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+    color: #fff;
+  }
+
+  .btn-ghost {
+    border-color: transparent;
+  }
+
+  .btn-danger {
+    border-color: transparent;
+    color: var(--danger);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 15%, transparent);
+    color: var(--danger);
+  }
+
+  /* Square icon button. `--size` lets one class serve a 28px desktop toolbar
+     and a 48px touch target without a second set of rules. */
+  .icon-btn {
+    --size: 28px;
+    display: inline-grid;
+    place-items: center;
+    width: var(--size);
+    height: var(--size);
+    flex-shrink: 0;
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    background: transparent;
+    cursor: pointer;
+    transition:
+      background-color 120ms var(--ease),
+      color 120ms var(--ease);
+  }
+  .icon-btn:hover:not(:disabled) {
+    background: var(--surface-hi);
+    color: var(--text);
+  }
+  .icon-btn:active:not(:disabled) {
+    background: var(--surface-active);
+  }
+  .icon-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .icon-btn-touch {
+    --size: var(--tap);
+    border-radius: var(--radius-lg);
+  }
+  .icon-btn-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 18%, transparent);
+    color: var(--danger);
+  }
+
+  .field {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border-hi);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    color: var(--text);
+    font-size: 14px;
+    transition: border-color 120ms var(--ease);
+  }
+  .field::placeholder {
+    color: var(--text-faint);
+  }
+  .field:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .field:focus-visible {
+    outline: none;
+  }
+
+  .label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  /* ── list rows ────────────────────────────────────────────────────── */
+
+  /* One row rule for folders, videos and clips. Density comes from
+     `--row-h`, set per surface, so the touch build is a variable change
+     rather than a parallel component. */
+  .row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    min-height: var(--row-h);
+    flex-shrink: 0;
+    padding-inline: 10px;
+    color: var(--text-dim);
+    text-align: left;
+    cursor: default;
+    user-select: none;
+    border: 1px solid transparent;
+    transition:
+      background-color 100ms var(--ease),
+      color 100ms var(--ease);
+  }
+  .row:hover {
+    background: var(--surface-hi);
+    color: var(--text);
+  }
+  .row[data-selected="true"] {
+    background: var(--accent);
+    color: #fff;
+  }
+  .row[data-selected="true"]:hover {
+    background: var(--accent);
+  }
+  .row-touch {
+    --row-h: var(--row-h-touch);
+    padding-inline: 12px;
+    gap: 12px;
+  }
+
+  /* Actions that appear on hover on a pointer device stay permanently
+     visible where there is no hover — otherwise they are unreachable. */
+  .row-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 120ms var(--ease);
+  }
+  .row:hover .row-actions,
+  .row:focus-within .row-actions {
+    opacity: 1;
+  }
+  @media (hover: none) {
+    .row-actions {
+      opacity: 1;
+    }
+  }
+
+  /* ── bits ─────────────────────────────────────────────────────────── */
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--surface-hi);
+    color: var(--text-faint);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .kbd {
+    display: inline-block;
+    min-width: 18px;
+    padding: 1px 5px;
+    border: 1px solid var(--border-hi);
+    border-bottom-width: 2px;
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: 11px;
+    font-family: inherit;
+    text-align: center;
+  }
+
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: flex;
+    background: rgb(0 0 0 / 0.7);
+    backdrop-filter: blur(4px);
+  }
+
+  .dialog {
+    background: var(--surface);
+    border: 1px solid var(--border-hi);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-pop);
+  }
+
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    height: 100%;
+    padding: var(--space-5) var(--space-3);
+    text-align: center;
+    color: var(--text-faint);
+    font-size: 13px;
+  }
 }
-.scrollbar-none {
-  -ms-overflow-style: none;
-  scrollbar-width: none;
-}
+
+/* ── utilities ──────────────────────────────────────────────────────── */
 
 .t-num {
   font-variant-numeric: tabular-nums;
@@ -93,4 +373,28 @@ body {
 .scrollbar-none {
   -ms-overflow-style: none;
   scrollbar-width: none;
+}
+
+/* A thin scrollbar that only shows where content actually overflows; the
+   default one is a light-grey slab on a near-black panel. */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-hi) transparent;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: var(--border-hi);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: content-box;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
 }

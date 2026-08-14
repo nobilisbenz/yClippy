@@ -56,7 +56,7 @@
 
 <div
     bind:this={menuEl}
-    class="fixed z-[100] min-w-[160px] py-1 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl flex flex-col"
+    class="fixed z-[280] min-w-[180px] py-1 dialog rounded-[8px] flex flex-col"
     style="left: {x}px; top: {y}px;"
     onmousedown={(e) => e.stopPropagation()}
     onclick={(e) => e.stopPropagation()}
@@ -66,8 +66,9 @@
 >
     {#each items as item}
         <button
-            class="px-3 py-2 text-left text-sm hover:bg-zinc-700 transition-colors flex items-center gap-2
-            {item.danger ? 'text-red-400 hover:text-red-300' : 'text-zinc-200'}"
+            class="px-3 py-2 text-left text-[13px] transition-colors flex items-center gap-2
+            hover:bg-[color:var(--surface-hi)]
+            {item.danger ? 'text-[color:var(--danger)]' : 'text-[color:var(--text-dim)] hover:text-[color:var(--text)]'}"
             onclick={() => {
                 item.action();
                 onClose();

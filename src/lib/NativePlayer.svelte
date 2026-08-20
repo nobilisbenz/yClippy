@@ -271,7 +271,7 @@
             <button
                 class="shrink-0 w-full h-14 flex items-center justify-center gap-2 text-sm tracking-[0.12em] uppercase transition-colors
                        {yt.pendingStart !== null
-                    ? 'bg-[color:var(--accent)] text-white'
+                    ? 'bg-[color:var(--accent)] text-[color:var(--on-accent)]'
                     : 'bg-[color:var(--surface-hi)] text-[color:var(--text-dim)]'}"
                 onclick={onMarkTap}
             >

@@ -194,7 +194,7 @@
                         onmouseenter={() => (selectedIndex = i)}
                         class="w-full flex items-center justify-between gap-3 px-4 py-2 text-left text-sm transition-colors {i ===
                         selectedIndex
-                            ? 'bg-[color:var(--accent)] text-white'
+                            ? 'bg-[color:var(--accent)] text-[color:var(--on-accent)]'
                             : 'text-[color:var(--text-dim)] hover:bg-[color:var(--surface-hi)]'}"
                     >
                         <div class="flex items-center gap-2.5 truncate">
@@ -214,7 +214,7 @@
                         </div>
                         <span
                             class="text-[11px] t-num shrink-0 {i === selectedIndex
-                                ? 'text-white/80'
+                                ? 'text-[color:var(--on-accent)] opacity-70'
                                 : 'text-[color:var(--text-faint)]'}"
                         >
                             {hintFor(item)}

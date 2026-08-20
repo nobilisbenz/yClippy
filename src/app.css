@@ -1,11 +1,17 @@
 @import "tailwindcss";
+/*
+ * The ecosystem's tokens. Generated from `assets/design/tokens.json` in the
+ * yalive repository, shared with the yalive TUI, yGraphy, and yReviewy. Edit
+ * the tokens and rerun `assets/design/generate.py`; do not redeclare a value
+ * here that the token file already owns.
+ */
+@import "./tokens.css";
 
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-family: var(--font-sans);
   line-height: 1.5;
   font-weight: 400;
 
-  color-scheme: dark;
   color: var(--text);
   background-color: var(--bg);
 
@@ -14,40 +20,12 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  --bg: #08080a;
-  --surface: #0f0f12;
-  --surface-hi: #1a1a1f;
-  --surface-active: #212128;
-  --border: #1f1f24;
-  --border-hi: #2a2a30;
-  --text: #f4f4f5;
-  --text-dim: #a1a1aa;
-  --text-faint: #52525b;
-  --accent: #3b82f6;
-  --accent-hover: #2563eb;
-  --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
-  --danger: #ef4444;
-  --danger-hover: #dc2626;
-  --success: #22c55e;
-
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 16px;
-  --space-4: 24px;
-  --space-5: 32px;
-
-  --radius-sm: 4px;
-  --radius: 6px;
-  --radius-lg: 10px;
-  --radius-xl: 14px;
-
+  /* yClippy's own metrics. Everything above the fold in tokens.css is shared;
+     these are sizes only a video app has an opinion about. */
   --row-h: 32px;
   --row-h-touch: 56px;
   --tap: 48px;
   --titlebar-h: 40px;
-
-  --shadow-pop: 0 10px 30px -10px rgb(0 0 0 / 0.8), 0 2px 8px rgb(0 0 0 / 0.5);
-  --ease: cubic-bezier(0.2, 0, 0, 1);
 
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
@@ -156,13 +134,13 @@ button:focus:not(:focus-visible) {
   .btn-primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     font-weight: 500;
   }
   .btn-primary:hover:not(:disabled) {
     background: var(--accent-hover);
     border-color: var(--accent-hover);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .btn-ghost {
@@ -271,7 +249,7 @@ button:focus:not(:focus-visible) {
   }
   .row[data-selected="true"] {
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
   .row[data-selected="true"]:hover {
     background: var(--accent);
